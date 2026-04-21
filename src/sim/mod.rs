@@ -26,8 +26,8 @@ enum TransistorKind {
 pub struct SignalGraph {
     // signal data
     pub signals: Vec<SignalState>,
-    driven: Vec<Option<SignalState>>,
-    signal_names: Vec<Option<String>>,
+    pub driven: Vec<Option<SignalState>>,
+    pub signal_names: Vec<Option<String>>,
     // transistor data
     kinds: Vec<TransistorKind>,
     gates: Vec<SignalId>,
@@ -242,7 +242,7 @@ impl SignalGraph {
         //         |
         //        GND
         let out = self.add_signal(Some("NAND_OUT"));
-        let mid = self.add_signal(None);
+        let mid = self.add_signal(Some("MID"));
         self.add_transistor(TransistorKind::PMOS, a, self.vdd(), out);
         self.add_transistor(TransistorKind::PMOS, b, self.vdd(), out);
         self.add_transistor(TransistorKind::NMOS, a, mid, out);
