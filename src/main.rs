@@ -90,7 +90,6 @@ impl SignalGraph {
     }
 
     /// (signal graph -> dependents, in_degree)
-    /// recompute self.eval_order internally
     fn build_dep_map(&self) -> (Vec<Vec<usize>>, Vec<usize>) {
         // step 1: build a hashmap that stores the gates at a specific signal
         let signal_to_transistors = self.gates.iter().enumerate().fold(
@@ -119,6 +118,93 @@ impl SignalGraph {
             },
         );
         (dependents, in_degree)
+    }
+
+    fn compute_eval_order(&mut self) {
+        self.eval_order.clear();
+        let (dependents, mut in_degrees) = self.build_dep_map();
+        let mut eval_queue: VecDeque<usize> = in_degrees
+            .iter()
+            .enumerate()
+            .filter(|x| *x.1 == 0)
+            .map(|(i, _)| i)
+            .collect();
+        while let Some(i) = eval_queue.pop_front() {
+            self.eval_order.push(TransistorId(i));
+            dependents[i].iter().for_each(|j| {
+                in_degrees[*j] -= 1;
+                if in_degrees[*j] == 0 {
+                    eval_queue.push_back(*j);
+                }
+            });
+        }
+        if self.eval_order.len() < self.kinds.len() {
+            println!("cycles exist");
+        }
+        self.dirty = false;
+    }
+
+    fn resolve(a: SignalState, b: SignalState) -> SignalState {
+        match (a, b) {
+            (SignalState::High, SignalState::High) => SignalState::High,
+            (SignalState::High, SignalState::Low) => SignalState::Conflict,
+            (SignalState::High, SignalState::Floating) => SignalState::High,
+            (SignalState::Low, SignalState::High) => SignalState::Conflict,
+            (SignalState::Low, SignalState::Low) => SignalState::Low,
+            (SignalState::Low, SignalState::Floating) => SignalState::Low,
+            (SignalState::Floating, SignalState::High) => SignalState::High,
+            (SignalState::Floating, SignalState::Low) => SignalState::Low,
+            (SignalState::Floating, SignalState::Floating) => SignalState::Floating,
+            (_, SignalState::Conflict) => SignalState::Conflict,
+            (SignalState::Conflict, _) => SignalState::Conflict,
+        }
+    }
+
+    fn propagate(&mut self) {
+        // step 1: recompute eval_order if dirty
+        if self.dirty {
+            self.compute_eval_order();
+        }
+
+        // step 2: reset all non-externally-driven signals to Floating
+        for i in 0..self.signals.len() {
+            if self.driven[i].is_none() {
+                self.signals[i] = SignalState::Floating;
+            }
+        }
+
+        // step 3: evaluate transistors in eval_order
+        // for each transistor;
+        // -    check gate state
+        // -    determine conductivity based on kind
+        // -    if conducting, resolve source and drain states
+        for i in 0..self.eval_order.len() {
+            let transistor_idx = self.eval_order[i].0;
+            let kind = self.kinds[transistor_idx];
+            let gate = self.gates[transistor_idx].0;
+            let source = self.sources[transistor_idx].0;
+            let drain = self.drains[transistor_idx].0;
+
+            let gate_state = self.signals[gate];
+
+            let conducting = match kind {
+                TransistorKind::NMOS => gate_state == SignalState::High,
+                TransistorKind::PMOS => gate_state == SignalState::Low,
+            };
+
+            if conducting {
+                let resolved = SignalGraph::resolve(self.signals[source], self.signals[drain]);
+                self.signals[source] = resolved;
+                self.signals[drain] = resolved;
+            }
+        }
+
+        // step 4: apply external drives
+        for i in 0..self.signals.len() {
+            if let Some(state) = self.driven[i] {
+                self.signals[i] = state;
+            }
+        }
     }
 }
 
