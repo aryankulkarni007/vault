@@ -3,10 +3,10 @@ use std::collections::VecDeque;
 use std::vec;
 
 /// index for signals
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct SignalId(usize);
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum SignalState {
     High,
     Low,
@@ -14,10 +14,10 @@ enum SignalState {
     Conflict, // two drivers fighting - short circuit (visual needed)
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct TransistorId(usize);
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum TransistorKind {
     NMOS,
     PMOS,
@@ -89,8 +89,8 @@ impl SignalGraph {
         self.driven[id.0] = state;
     }
 
-    /// (signal graph -> dependents, in_degree)
-    fn build_dep_map(&self) -> (Vec<Vec<usize>>, Vec<usize>) {
+    /// (signal graph -> dependents, in_degree -> eval_order)
+    fn kahn(&mut self) {
         // step 1: build a hashmap that stores the gates at a specific signal
         let signal_to_transistors = self.gates.iter().enumerate().fold(
             HashMap::new(),
@@ -104,7 +104,7 @@ impl SignalGraph {
 
         // step 2
         let n = self.kinds.len();
-        let (dependents, in_degree) = self.drains.iter().enumerate().fold(
+        let (dependents, mut in_degree) = self.drains.iter().enumerate().fold(
             (vec![vec![]; n], vec![0usize; n]),
             |mut acc, (i, drain_signal)| {
                 // reindex the signal_to_transistors vec to be
@@ -117,13 +117,10 @@ impl SignalGraph {
                 acc
             },
         );
-        (dependents, in_degree)
-    }
 
-    fn compute_eval_order(&mut self) {
+        // merged compute eval_order from here
         self.eval_order.clear();
-        let (dependents, mut in_degrees) = self.build_dep_map();
-        let mut eval_queue: VecDeque<usize> = in_degrees
+        let mut eval_queue: VecDeque<usize> = in_degree
             .iter()
             .enumerate()
             .filter(|x| *x.1 == 0)
@@ -132,8 +129,8 @@ impl SignalGraph {
         while let Some(i) = eval_queue.pop_front() {
             self.eval_order.push(TransistorId(i));
             dependents[i].iter().for_each(|j| {
-                in_degrees[*j] -= 1;
-                if in_degrees[*j] == 0 {
+                in_degree[*j] -= 1;
+                if in_degree[*j] == 0 {
                     eval_queue.push_back(*j);
                 }
             });
@@ -163,40 +160,55 @@ impl SignalGraph {
     fn propagate(&mut self) {
         // step 1: recompute eval_order if dirty
         if self.dirty {
-            self.compute_eval_order();
+            self.kahn();
         }
 
         // step 2: reset all non-externally-driven signals to Floating
         for i in 0..self.signals.len() {
-            if self.driven[i].is_none() {
+            if let Some(state) = self.driven[i] {
+                self.signals[i] = state;
+            } else {
                 self.signals[i] = SignalState::Floating;
             }
         }
+
+        // safety
+        let mut iterations = 0;
+        let max_iterations = self.kinds.len() + 1;
 
         // step 3: evaluate transistors in eval_order
         // for each transistor;
         // -    check gate state
         // -    determine conductivity based on kind
         // -    if conducting, resolve source and drain states
-        for i in 0..self.eval_order.len() {
-            let transistor_idx = self.eval_order[i].0;
-            let kind = self.kinds[transistor_idx];
-            let gate = self.gates[transistor_idx].0;
-            let source = self.sources[transistor_idx].0;
-            let drain = self.drains[transistor_idx].0;
+        loop {
+            // NOTE: loop is for iterative relaxation
+            // deals with the issue of cyclic dependency
+            let prev = self.signals.clone();
+            for i in 0..self.eval_order.len() {
+                let transistor_idx = self.eval_order[i].0;
+                let kind = self.kinds[transistor_idx];
+                let gate = self.gates[transistor_idx].0;
+                let source = self.sources[transistor_idx].0;
+                let drain = self.drains[transistor_idx].0;
 
-            let gate_state = self.signals[gate];
+                let gate_state = self.signals[gate];
 
-            let conducting = match kind {
-                TransistorKind::NMOS => gate_state == SignalState::High,
-                TransistorKind::PMOS => gate_state == SignalState::Low,
-            };
+                let conducting = match kind {
+                    TransistorKind::NMOS => gate_state == SignalState::High,
+                    TransistorKind::PMOS => gate_state == SignalState::Low,
+                };
 
-            if conducting {
-                let resolved = SignalGraph::resolve(self.signals[source], self.signals[drain]);
-                self.signals[source] = resolved;
-                self.signals[drain] = resolved;
+                if conducting {
+                    let resolved = SignalGraph::resolve(self.signals[source], self.signals[drain]);
+                    self.signals[source] = resolved;
+                    self.signals[drain] = resolved;
+                }
             }
+            if self.signals == prev || iterations >= max_iterations {
+                break;
+            }
+            iterations += 1;
         }
 
         // step 4: apply external drives
@@ -206,8 +218,80 @@ impl SignalGraph {
             }
         }
     }
+
+    fn vdd(&self) -> SignalId {
+        SignalId(0)
+    }
+    fn gnd(&self) -> SignalId {
+        SignalId(1)
+    }
+
+    fn nand(&mut self, a: SignalId, b: SignalId) -> SignalId {
+        // we can think of signal ids as wires. if two gates share the id,
+        // they are connected. they are implicit wires and this design
+        // allows us to never have to store that as a separate state or construct
+        // VDD ──┬──────────┐           nand architecture
+        // [PMOS_1,A] [PMOS_2,B]
+        //    └──────────┘
+        //         |
+        //        OUT
+        //         |
+        //     [NMOS_1,A]
+        //         |
+        //     [NMOS_2,B]
+        //         |
+        //        GND
+        let out = self.add_signal(Some("NAND_OUT"));
+        let mid = self.add_signal(None);
+        self.add_transistor(TransistorKind::PMOS, a, self.vdd(), out);
+        self.add_transistor(TransistorKind::PMOS, b, self.vdd(), out);
+        self.add_transistor(TransistorKind::NMOS, a, mid, out);
+        self.add_transistor(TransistorKind::NMOS, b, self.gnd(), mid);
+        out
+    }
 }
 
 fn main() {
-    println!("Hello, world!");
+    // initialisation of the circuit
+    let mut signal_graph = SignalGraph::new();
+    let a = signal_graph.add_signal(Some("A"));
+    let b = signal_graph.add_signal(Some("B"));
+    let _out = signal_graph.nand(a, b);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nand() {
+        let mut g = SignalGraph::new();
+        let a = g.add_signal(Some("A"));
+        let b = g.add_signal(Some("B"));
+        let out = g.nand(a, b);
+
+        // test case 1 (Low Low -> High)
+        g.drive(a, Some(SignalState::Low));
+        g.drive(b, Some(SignalState::Low));
+        g.propagate();
+        assert_eq!(g.signals[out.0], SignalState::High);
+
+        // test case 2 (Low High -> High)
+        g.drive(a, Some(SignalState::Low));
+        g.drive(b, Some(SignalState::High));
+        g.propagate();
+        assert_eq!(g.signals[out.0], SignalState::High);
+
+        // test case 3 (High Low -> High)
+        g.drive(a, Some(SignalState::High));
+        g.drive(b, Some(SignalState::Low));
+        g.propagate();
+        assert_eq!(g.signals[out.0], SignalState::High);
+
+        // test case 4 (High High -> Low)
+        g.drive(a, Some(SignalState::High));
+        g.drive(b, Some(SignalState::High));
+        g.propagate();
+        assert_eq!(g.signals[out.0], SignalState::Low);
+    }
 }
