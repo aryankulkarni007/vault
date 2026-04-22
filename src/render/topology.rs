@@ -2,6 +2,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::style::Style;
+use ratatui::text::Line;
+use ratatui::text::Span;
 use ratatui::widgets::Block;
 use ratatui::widgets::Borders;
 use ratatui::widgets::Widget;
@@ -58,126 +60,148 @@ pub struct TopologyWidget<'a> {
 
 impl<'a> Widget for TopologyWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // 1. STATE & STYLING PREP
         let output_state = self.graph.signals[self.layout.output_signal.0];
-        let border_style = wire_style(output_state);
+        let border_color = wire_style(output_state);
+        let title_style = Style::default().fg(Color::Rgb(255, 200, 0));
 
+        // 2. BLOCK RENDER
+        // We use a Line to mix styles: border characters inherit block style, text is gold.
         let block = Block::default()
-            .title(format!("─ {} ", self.layout.label))
             .borders(Borders::ALL)
-            .border_style(border_style);
+            .border_style(border_color)
+            .title(Line::from(vec![
+                Span::raw("─ "),
+                Span::styled(self.layout.label.to_uppercase(), title_style),
+                Span::raw(" "),
+            ]));
 
+        // Calculate the inner area (where we can actually draw)
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let vdd_state = self.graph.signals[0];
-        let vdd_style = wire_style(vdd_state);
-        let vdd_char = wire_char(vdd_state);
+        // If the window is too tiny to even show the inner area, abort to prevent panics.
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
 
-        let label = " VDD ";
-        let rail_w = (inner.width.saturating_sub(label.len() as u16)) / 2;
-        let rail: String = vdd_char.repeat(rail_w as usize);
-        let vdd_line = format!("{}{}{}", rail, label, rail);
-        buf.set_string(inner.x, inner.y, &vdd_line, vdd_style);
-
-        let pmos_row_y = inner.y + 2; // one line gap after VDD rail
-
-        for node in self
+        // 3. DIMENSION CALCULATION
+        // Partition nodes once to avoid multiple filter/iter passes
+        let (pmos_nodes, nmos_nodes): (Vec<_>, Vec<_>) = self
             .layout
             .nodes
             .iter()
-            .filter(|n| n.kind == TransistorKind::PMOS)
-        {
-            let x = inner.x + GATE_WIRE_W + node.col * CELL_W;
+            .partition(|n| n.kind == TransistorKind::PMOS);
 
-            // gate wire: "A ━━━━┤"
-            let gate_state = self.graph.signals[node.gate_signal.0];
-            let gate_name = self.graph.signal_names[node.gate_signal.0]
+        let p_count = pmos_nodes.len() as u16;
+        let n_count = nmos_nodes.len() as u16;
+
+        // Content Width: Space for gate labels + width of all PMOS columns
+        let content_w = GATE_WIRE_W + (p_count.max(1) * CELL_W);
+        // Content Height: VDD + Gap + PMOS + Merge + (NMOS stack) + GND
+        let content_h = 4 + (n_count * ROW_H) + 1;
+
+        // 4. CENTERING & CLIPPING LOGIC
+        // We calculate offsets relative to 'inner' area.
+        let offset_x = inner.x + inner.width.saturating_sub(content_w) / 2;
+        let offset_y = inner.y + inner.height.saturating_sub(content_h) / 2;
+
+        // Boundary check helper: prevents writing outside the widget's allocated area.
+        let mut draw = |x_rel: u16, y_rel: u16, text: &str, style: Style| {
+            let abs_x = offset_x + x_rel;
+            let abs_y = offset_y + y_rel;
+            if abs_x < inner.right() && abs_y < inner.bottom() {
+                buf.set_string(abs_x, abs_y, text, style);
+            }
+        };
+
+        // 5. DRAW VDD RAIL
+        let vdd_state = self.graph.signals[0];
+        let vdd_s = wire_style(vdd_state);
+        let v_char = wire_char(vdd_state);
+        let vdd_label = " VDD ";
+        let v_rail_len = (content_w.saturating_sub(vdd_label.len() as u16)) / 2;
+        let vdd_line = format!(
+            "{}{}{}",
+            v_char.repeat(v_rail_len as usize),
+            vdd_label,
+            v_char.repeat(v_rail_len as usize)
+        );
+        draw(0, 0, &vdd_line, vdd_s);
+
+        // 6. DRAW PMOS ARRAY (Top)
+        let pmos_y = 2;
+        for node in &pmos_nodes {
+            let x = GATE_WIRE_W + node.col * CELL_W;
+            let gate_s = wire_style(self.graph.signals[node.gate_signal.0]);
+            let out_s = wire_style(self.graph.signals[node.vertical_out.0]);
+            let name = self.graph.signal_names[node.gate_signal.0]
                 .as_deref()
                 .unwrap_or("?");
-            let gate_wire = format!("{} ━━━┤", gate_name);
-            buf.set_string(
+
+            draw(
                 x - GATE_WIRE_W,
-                pmos_row_y,
-                &gate_wire,
-                wire_style(gate_state),
+                pmos_y,
+                &format!("{:<2} ━━━┤", name),
+                gate_s,
             );
+            draw(x, pmos_y, "[P]", out_s);
+            draw(x + 1, pmos_y + 1, "┃", out_s);
+        }
 
-            // transistor block
-            let conducting_state = self.graph.signals[node.vertical_out.0];
-            buf.set_string(x, pmos_row_y, "[P]", wire_style(conducting_state));
+        // 7. DRAW MERGE BAR & OUTPUT
+        let merge_y = pmos_y + 2;
+        let out_s = wire_style(output_state);
+        let merge_start = GATE_WIRE_W + 1;
+        let merge_end = GATE_WIRE_W + (p_count.saturating_sub(1) * CELL_W) + 1;
 
-            // vertical wire below
-            let vert_state = self.graph.signals[node.vertical_out.0];
-            buf.set_string(x + 1, pmos_row_y + 1, "┃", wire_style(vert_state));
+        for mx in merge_start..=merge_end {
+            draw(mx, merge_y, "─", out_s);
+        }
+        draw(merge_start, merge_y, "└", out_s);
+        draw(merge_end, merge_y, "┘", out_s);
 
-            // merge line — connects PMOS outputs down to OUT
-            let pmos_count = self
-                .layout
-                .nodes
-                .iter()
-                .filter(|n| n.kind == TransistorKind::PMOS)
-                .count() as u16;
-            let merge_y = pmos_row_y + 2;
-            let out_state = self.graph.signals[self.layout.output_signal.0];
-            let out_style = wire_style(out_state);
+        let mid_x = (merge_start + merge_end) / 2;
+        draw(mid_x, merge_y, "┬", out_s);
+        draw(mid_x, merge_y + 1, "┃ OUT", out_s);
 
-            // draw horizontal merge bar
-            let merge_x_start = inner.x + GATE_WIRE_W + 1;
-            let merge_x_end = inner.x + GATE_WIRE_W + (pmos_count - 1) * CELL_W + 1;
-            for x in merge_x_start..=merge_x_end {
-                buf.set_string(x, merge_y, "─", out_style);
-            }
+        // 8. DRAW NMOS STACK (Bottom)
+        let nmos_start_y = merge_y + 2;
+        for (i, node) in nmos_nodes.iter().enumerate() {
+            let y = nmos_start_y + (i as u16 * ROW_H);
+            let gate_s = wire_style(self.graph.signals[node.gate_signal.0]);
+            let name = self.graph.signal_names[node.gate_signal.0]
+                .as_deref()
+                .unwrap_or("?");
 
-            // corners and center drop
-            buf.set_string(merge_x_start, merge_y, "└", out_style);
-            buf.set_string(merge_x_end, merge_y, "┘", out_style);
-            let mid_x = (merge_x_start + merge_x_end) / 2;
-            buf.set_string(mid_x, merge_y, "┬", out_style);
-            buf.set_string(mid_x, merge_y + 1, "┃", out_style);
+            draw(
+                mid_x - GATE_WIRE_W,
+                y,
+                &format!("{:<2} ╌╌╌╌┤", name),
+                gate_s,
+            );
+            draw(mid_x, y, "[N]", gate_s);
 
-            // OUT label
-            let out_label = "┃ OUT".to_string();
-            buf.set_string(mid_x, merge_y + 1, &out_label, out_style);
-
-            let nmos_start_y = merge_y + 2;
-            for node in self
-                .layout
-                .nodes
-                .iter()
-                .filter(|n| n.kind == TransistorKind::NMOS)
-            {
-                let y = nmos_start_y + node.row * ROW_H;
-                let gate_state = self.graph.signals[node.gate_signal.0];
-                let gate_name = self.graph.signal_names[node.gate_signal.0]
-                    .as_deref()
-                    .unwrap_or("?");
-
-                // gate wire
-                let gate_wire = format!("{} ╌╌╌╌┤", gate_name);
-                buf.set_string(mid_x - GATE_WIRE_W, y, &gate_wire, wire_style(gate_state));
-
-                // transistor block
-                buf.set_string(mid_x, y, "[N]", wire_style(gate_state));
-
-                // vertical wire below
-                let vert_state = self.graph.signals[node.vertical_out.0];
-                buf.set_string(mid_x, y + 1, "┃", wire_style(vert_state));
-
-                let gnd_state = self.graph.signals[1];
-                let gnd_char = wire_char(gnd_state);
-
-                let label = " GND ";
-                let rail_w = (inner.width.saturating_sub(label.len() as u16)) / 2;
-                let rail: String = gnd_char.repeat(rail_w as usize);
-                let gnd_line = format!("{}{}{}", rail, label, rail);
-                buf.set_string(
-                    inner.x,
-                    inner.y + inner.height - 1,
-                    &gnd_line,
-                    wire_style(gnd_state),
-                );
+            // Only draw vertical connector if there's another transistor below
+            if (i as u16) < n_count - 1 {
+                let v_out_s = wire_style(self.graph.signals[node.vertical_out.0]);
+                draw(mid_x, y + 1, "┃", v_out_s);
             }
         }
+
+        // 9. DRAW GND RAIL
+        let gnd_state = self.graph.signals[1];
+        let gnd_s = wire_style(gnd_state);
+        let g_char = wire_char(gnd_state);
+        let gnd_label = " GND ";
+        let g_rail_len = (content_w.saturating_sub(gnd_label.len() as u16)) / 2;
+        let gnd_line = format!(
+            "{}{}{}",
+            g_char.repeat(g_rail_len as usize),
+            gnd_label,
+            g_char.repeat(g_rail_len as usize)
+        );
+        draw(0, content_h - 1, &gnd_line, gnd_s);
     }
 }
 
