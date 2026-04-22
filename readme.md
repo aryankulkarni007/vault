@@ -55,3 +55,56 @@ impl Index<TransistorId> for SignalGraph {
    If any hit in-degree 0, add them to the queue.
 
 4. Repeat step 3 until the queue is empty.
+
+# find_clusters
+
+O(n^2) implementation:
+
+```rust
+pub fn find_clusters(graph: &SignalGraph, transistors: &[usize]) -> Vec<Vec<usize>> {
+    // we need to a union find on transistors index
+    // transistors are in the same cluster if
+    // they share any signal that isn't gnd or vdd
+    let n = transistors.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    /// this function recursively calls itself to find the
+    /// 'oldest relative' to the current child by walking up the tree
+    fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+        if parent[x] != x {
+            parent[x] = find(parent, parent[x]);
+        }
+        parent[x]
+    }
+    /// unions two transistors to the parent of the first
+    fn union(parent: &mut Vec<usize>, x: usize, y: usize) {
+        let px = find(parent, x);
+        let py = find(parent, y);
+        parent[px] = py;
+    }
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let ti = transistors[i];
+            let tj = transistors[j];
+            let sigs_i = [graph.gates[ti], graph.sources[ti], graph.drains[ti]];
+            let sigs_j = [graph.gates[tj], graph.sources[tj], graph.drains[tj]];
+            let shared = sigs_i.iter().any(|s| {
+                // > 1 skips vdd and gnd
+                s.0 > 1 && sigs_j.contains(s)
+            });
+            if shared {
+                union(&mut parent, i, j);
+            }
+        }
+    }
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    (0..n).for_each(|i| {
+        groups
+            .entry(find(&mut parent, i))
+            .or_default()
+            .push(transistors[i]);
+    });
+    groups.into_values().collect()
+}
+```

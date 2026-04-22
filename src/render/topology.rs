@@ -8,6 +8,7 @@ use ratatui::widgets::Block;
 use ratatui::widgets::Borders;
 use ratatui::widgets::Widget;
 
+use crate::render::layout::find_clusters;
 use crate::sim::GateDescriptor;
 use crate::sim::SignalGraph;
 use crate::sim::SignalId;
@@ -49,8 +50,14 @@ pub struct TransistorNode {
 
 pub struct GateLayout {
     pub label: String,
-    pub nodes: Vec<TransistorNode>,
+    pub clusters: Vec<ClusterLayout>,
     pub output_signal: SignalId,
+}
+
+pub struct ClusterLayout {
+    pub output: SignalId,
+    pub pmos: Vec<TransistorNode>,
+    pub nmos: Vec<TransistorNode>,
 }
 
 pub struct TopologyWidget<'a> {
@@ -60,12 +67,12 @@ pub struct TopologyWidget<'a> {
 
 impl<'a> Widget for TopologyWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // 1. STATE & STYLING PREP
+        // STATE & STYLING PREP
         let output_state = self.graph.signals[self.layout.output_signal.0];
         let border_color = wire_style(output_state);
         let title_style = Style::default().fg(Color::Rgb(255, 200, 0));
 
-        // 2. BLOCK RENDER
+        // BLOCK RENDER
         // We use a Line to mix styles: border characters inherit block style, text is gold.
         let block = Block::default()
             .borders(Borders::ALL)
@@ -76,11 +83,11 @@ impl<'a> Widget for TopologyWidget<'a> {
                 Span::raw(" "),
             ]));
 
-        // Calculate the inner area (where we can actually draw)
+        // calculate the inner area
         let inner = block.inner(area);
         block.render(area, buf);
 
-        // If the window is too tiny to even show the inner area, abort to prevent panics.
+        // if the window is too tiny to even show the inner area, abort to prevent panics.
         if inner.width == 0 || inner.height == 0 {
             return;
         }
@@ -96,17 +103,17 @@ impl<'a> Widget for TopologyWidget<'a> {
         let p_count = pmos_nodes.len() as u16;
         let n_count = nmos_nodes.len() as u16;
 
-        // Content Width: Space for gate labels + width of all PMOS columns
+        // content width: space for gate labels + width of all pmos columns
         let content_w = GATE_WIRE_W + (p_count.max(1) * CELL_W);
-        // Content Height: VDD + Gap + PMOS + Merge + (NMOS stack) + GND
+        // content height: vdd + gap + pmos + merge + (nmos stack) + gnd
         let content_h = 4 + (n_count * ROW_H) + 1;
 
-        // 4. CENTERING & CLIPPING LOGIC
-        // We calculate offsets relative to 'inner' area.
+        // CENTERING & CLIPPING LOGIC
+        // we calculate offsets relative to 'inner' area.
         let offset_x = inner.x + inner.width.saturating_sub(content_w) / 2;
         let offset_y = inner.y + inner.height.saturating_sub(content_h) / 2;
 
-        // Boundary check helper: prevents writing outside the widget's allocated area.
+        // boundary check helper: prevents writing outside the widget's allocated area.
         let mut draw = |x_rel: u16, y_rel: u16, text: &str, style: Style| {
             let abs_x = offset_x + x_rel;
             let abs_y = offset_y + y_rel;
@@ -129,7 +136,7 @@ impl<'a> Widget for TopologyWidget<'a> {
         );
         draw(0, 0, &vdd_line, vdd_s);
 
-        // 6. DRAW PMOS ARRAY (Top)
+        // DRAW PMOS ARRAY (Top)
         let pmos_y = 2;
         for node in &pmos_nodes {
             let x = GATE_WIRE_W + node.col * CELL_W;
@@ -205,14 +212,18 @@ impl<'a> Widget for TopologyWidget<'a> {
     }
 }
 
-pub fn layout_gate(graph: &SignalGraph, descriptor: &GateDescriptor, label: &str) -> GateLayout {
-    let (pmos_ids, nmos_ids): (Vec<usize>, Vec<usize>) = descriptor
-        .transistors
+fn layout_cluster(graph: &SignalGraph, transistors: &[usize]) -> ClusterLayout {
+    let (pmos_ids, nmos_ids): (Vec<usize>, Vec<usize>) = transistors
         .iter()
         .partition(|&&id| graph.kinds[id] == TransistorKind::PMOS);
-    let mut nmos_ordered: Vec<usize> = Vec::new();
-    let mut current_signal = descriptor.output;
 
+    let output = pmos_ids
+        .first()
+        .map(|&id| graph.drains[id])
+        .unwrap_or(SignalId(1));
+
+    let mut nmos_ordered: Vec<usize> = Vec::new();
+    let mut current_signal = output;
     loop {
         let next = nmos_ids
             .iter()
@@ -225,7 +236,8 @@ pub fn layout_gate(graph: &SignalGraph, descriptor: &GateDescriptor, label: &str
             None => break,
         }
     }
-    let nodes: Vec<TransistorNode> = pmos_ids
+
+    let pmos_nodes = pmos_ids
         .iter()
         .enumerate()
         .map(|(col, &id)| TransistorNode {
@@ -236,26 +248,35 @@ pub fn layout_gate(graph: &SignalGraph, descriptor: &GateDescriptor, label: &str
             vertical_out: graph.drains[id],
             col: col as u16,
             row: 0,
-        })
-        .chain(
-            nmos_ordered
-                .iter()
-                .enumerate()
-                .map(|(row, &id)| TransistorNode {
-                    id,
-                    kind: TransistorKind::NMOS,
-                    gate_signal: graph.gates[id],
-                    vertical_in: graph.drains[id],
-                    vertical_out: graph.sources[id],
-                    col: 0,
-                    row: row as u16,
-                }),
-        )
-        .collect();
+        });
 
+    let nmos_nodes = nmos_ordered
+        .iter()
+        .enumerate()
+        .map(|(row, &id)| TransistorNode {
+            id,
+            kind: TransistorKind::NMOS,
+            gate_signal: graph.gates[id],
+            vertical_in: graph.drains[id],
+            vertical_out: graph.sources[id],
+            col: 0,
+            row: row as u16,
+        });
+
+    ClusterLayout {
+        output,
+        pmos: pmos_nodes.collect(),
+        nmos: nmos_nodes.collect(),
+    }
+}
+
+pub fn layout_gate(graph: &SignalGraph, descriptor: &GateDescriptor, label: &str) -> GateLayout {
+    let clusters = find_clusters(graph, &descriptor.transistors);
+    let cluster_layouts: Vec<ClusterLayout> =
+        clusters.iter().map(|c| layout_cluster(graph, c)).collect();
     GateLayout {
         label: label.to_string(),
-        nodes,
+        clusters: cluster_layouts,
         output_signal: descriptor.output,
     }
 }

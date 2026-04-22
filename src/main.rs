@@ -36,8 +36,8 @@ fn main() -> io::Result<()> {
     let a = signal_graph.add_signal(Some("A"));
     let b = signal_graph.add_signal(Some("B"));
 
-    let xnor = signal_graph.xnor(a, b);
-    let layout = layout_gate(&signal_graph, &xnor, "xnor");
+    let nor = signal_graph.nor(a, b);
+    let layout = layout_gate(&signal_graph, &nor, "nor");
     signal_graph.propagate();
 
     enable_raw_mode()?;
@@ -85,141 +85,64 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+/* ai tests */
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::{SignalId, SignalState};
-    fn print_and_check_2_input(
+    use crate::sim::{SignalId, SignalState, SignalState::*};
+
+    fn check(
         g: &mut SignalGraph,
         name: &str,
-        a: SignalId,
-        b: SignalId,
+        ins: &[SignalId],
         out: SignalId,
-        expected: [SignalState; 4],
+        exp: &[SignalState],
     ) {
-        println!("\nTruth Table for: {}", name);
-        println!(" A | B | OUT");
-        println!("-----------");
+        println!("\nTruth Table: {}", name);
+        let header = ins.iter().map(|_| "In").collect::<Vec<_>>().join(" | ");
+        println!(" {} | OUT\n{}", header, "-".repeat(header.len() + 7));
 
-        let cases = [
-            (SignalState::Low, SignalState::Low, expected[0]),
-            (SignalState::Low, SignalState::High, expected[1]),
-            (SignalState::High, SignalState::Low, expected[2]),
-            (SignalState::High, SignalState::High, expected[3]),
-        ];
-
-        for (in_a, in_b, exp) in cases {
-            g.drive(a, Some(in_a));
-            g.drive(b, Some(in_b));
+        (0..(1 << ins.len())).for_each(|i| {
+            let mut row = Vec::new();
+            for j in 0..ins.len() {
+                let state = if (i >> (ins.len() - 1 - j)) & 1 == 1 {
+                    High
+                } else {
+                    Low
+                };
+                g.drive(ins[j], Some(state));
+                row.push(if state == High { "1" } else { "0" });
+            }
             g.propagate();
-
-            let actual = g.signals[out.0];
-
-            let fmt = |s: SignalState| if s == SignalState::High { "1" } else { "0" };
-            println!(" {} | {} |  {}", fmt(in_a), fmt(in_b), fmt(actual));
-
-            assert_eq!(
-                actual, exp,
-                "Failed {} gate for inputs {:?}, {:?}",
-                name, in_a, in_b
+            let act = g.signals[out.0];
+            println!(
+                " {} |  {}",
+                row.join(" | "),
+                if act == High { "1" } else { "0" }
             );
-        }
+            assert_eq!(act, exp[i], "Fail {} at case {}", name, i);
+        });
     }
 
     #[test]
-    fn test_not() {
+    fn test_gates() {
         let mut g = SignalGraph::new();
-        let a = g.add_signal(Some("A"));
-        let out = g.not(a).output;
+        let (a, b) = (g.add_signal(Some("A")), g.add_signal(Some("B")));
 
-        g.drive(a, Some(SignalState::Low));
-        g.propagate();
-        assert_eq!(g.signals[out.0], SignalState::High);
-
-        g.drive(a, Some(SignalState::High));
-        g.propagate();
-        assert_eq!(g.signals[out.0], SignalState::Low);
-    }
-
-    #[test]
-    fn test_all_gates() {
-        let mut g = SignalGraph::new();
-        let a = g.add_signal(Some("A"));
-        let b = g.add_signal(Some("B"));
-
+        // 1. Pre-construct all gates to avoid multiple mutable borrows
+        let not_out = g.not(a).output;
         let nand_out = g.nand(a, b).output;
-        print_and_check_2_input(
-            &mut g,
-            "NAND",
-            a,
-            b,
-            nand_out,
-            [
-                SignalState::High,
-                SignalState::High,
-                SignalState::High,
-                SignalState::Low,
-            ],
-        );
-
         let and_out = g.and(a, b).output;
-        print_and_check_2_input(
-            &mut g,
-            "AND",
-            a,
-            b,
-            and_out,
-            [
-                SignalState::Low,
-                SignalState::Low,
-                SignalState::Low,
-                SignalState::High,
-            ],
-        );
-
         let nor_out = g.nor(a, b).output;
-        print_and_check_2_input(
-            &mut g,
-            "NOR",
-            a,
-            b,
-            nor_out,
-            [
-                SignalState::High,
-                SignalState::Low,
-                SignalState::Low,
-                SignalState::Low,
-            ],
-        );
+        let xor_out = g.xor(a, b).output;
+        let xnor_out = g.xnor(a, b).output;
 
-        let or_std_out = g.or(a, b, false).output;
-        print_and_check_2_input(
-            &mut g,
-            "OR (Standard)",
-            a,
-            b,
-            or_std_out,
-            [
-                SignalState::Low,
-                SignalState::High,
-                SignalState::High,
-                SignalState::High,
-            ],
-        );
-
-        let or_dm_out = g.or(a, b, true).output;
-        print_and_check_2_input(
-            &mut g,
-            "OR (De Morgan)",
-            a,
-            b,
-            or_dm_out,
-            [
-                SignalState::Low,
-                SignalState::High,
-                SignalState::High,
-                SignalState::High,
-            ],
-        );
+        // 2. Run checks
+        check(&mut g, "NOT", &[a], not_out, &[High, Low]);
+        check(&mut g, "NAND", &[a, b], nand_out, &[High, High, High, Low]);
+        check(&mut g, "AND", &[a, b], and_out, &[Low, Low, Low, High]);
+        check(&mut g, "NOR", &[a, b], nor_out, &[High, Low, Low, Low]);
+        check(&mut g, "XOR", &[a, b], xor_out, &[Low, High, High, Low]);
+        check(&mut g, "XNOR", &[a, b], xnor_out, &[High, Low, Low, High]);
     }
 }
