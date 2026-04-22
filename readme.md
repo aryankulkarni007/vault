@@ -1,7 +1,9 @@
 # codename: vault -> the virtual computer
 
 This is not a virtual 'machine'. It is a virtual computer. Starting from
-software transistors, we simulate the computer from first principles
+software transistors, we simulate the computer from first principles. So far,
+we have the fundamentals. We have a working NAND gate and a half-working
+visualisation (we can flip a and b inputs using a and b :))
 
 ```rust
 /*

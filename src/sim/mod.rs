@@ -15,10 +15,10 @@ pub enum SignalState {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-struct TransistorId(usize);
+pub struct TransistorId(usize);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum TransistorKind {
+pub enum TransistorKind {
     NMOS,
     PMOS,
 }
@@ -29,12 +29,18 @@ pub struct SignalGraph {
     pub driven: Vec<Option<SignalState>>,
     pub signal_names: Vec<Option<String>>,
     // transistor data
-    kinds: Vec<TransistorKind>,
-    gates: Vec<SignalId>,
-    sources: Vec<SignalId>,
-    drains: Vec<SignalId>,
-    eval_order: Vec<TransistorId>, // for kahn's algorithm,
-    dirty: bool,                   // for lazy re-eval
+    pub kinds: Vec<TransistorKind>,
+    pub gates: Vec<SignalId>,
+    pub sources: Vec<SignalId>,
+    pub drains: Vec<SignalId>,
+    pub eval_order: Vec<TransistorId>, // for kahn's algorithm,
+    pub dirty: bool,                   // for lazy re-eval
+}
+
+/// for visualisation
+pub struct GateDescriptor {
+    pub output: SignalId,
+    pub transistors: Vec<usize>, // transistor indices
 }
 
 impl SignalGraph {
@@ -225,28 +231,124 @@ impl SignalGraph {
     fn gnd(&self) -> SignalId {
         SignalId(1)
     }
+}
 
-    pub fn nand(&mut self, a: SignalId, b: SignalId) -> SignalId {
-        // we can think of signal ids as wires. if two gates share the id,
-        // they are connected. they are implicit wires and this design
-        // allows us to never have to store that as a separate state or construct
-        // VDD ──┬──────────┐           nand architecture
+// logic gates
+impl SignalGraph {
+    pub fn nand(&mut self, a: SignalId, b: SignalId) -> GateDescriptor {
+        // VDD ──┬──────────┐            nand architecture
         // [PMOS_1,A] [PMOS_2,B]
         //    └──────────┘
         //         |
         //        OUT
         //         |
-        //     [NMOS_1,A]
+        //    [NMOS_1,A]
         //         |
-        //     [NMOS_2,B]
+        //    [NMOS_2,B]
         //         |
         //        GND
-        let out = self.add_signal(Some("NAND_OUT"));
-        let mid = self.add_signal(Some("MID"));
+        let out = self.add_signal(Some("OUT"));
+        let mid = self.add_signal(None);
+        let first = self.kinds.len();
         self.add_transistor(TransistorKind::PMOS, a, self.vdd(), out);
         self.add_transistor(TransistorKind::PMOS, b, self.vdd(), out);
         self.add_transistor(TransistorKind::NMOS, a, mid, out);
         self.add_transistor(TransistorKind::NMOS, b, self.gnd(), mid);
-        out
+        let last = self.kinds.len();
+
+        GateDescriptor {
+            output: out,
+            transistors: (first..last).collect(),
+        }
+    }
+
+    pub fn not(&mut self, a: SignalId) -> GateDescriptor {
+        // VDD           not architecture
+        //  |
+        // [PMOS, A]
+        //  |
+        // OUT
+        //  |
+        // [NMOS, A]
+        //  |
+        // GND
+        let out = self.add_signal(Some("OUT"));
+        let first = self.kinds.len();
+        self.add_transistor(TransistorKind::PMOS, a, self.vdd(), out);
+        self.add_transistor(TransistorKind::NMOS, a, self.gnd(), out);
+        let last = self.kinds.len();
+
+        GateDescriptor {
+            output: out,
+            transistors: (first..last).collect(),
+        }
+    }
+
+    pub fn and(&mut self, a: SignalId, b: SignalId) -> GateDescriptor {
+        // AND (NAND + NOT = 6 transistors)
+        let nand = self.nand(a, b);
+        let not = self.not(nand.output);
+
+        GateDescriptor {
+            output: not.output,
+            transistors: nand
+                .transistors
+                .into_iter()
+                .chain(not.transistors)
+                .collect(),
+        }
+    }
+
+    pub fn nor(&mut self, a: SignalId, b: SignalId) -> GateDescriptor {
+        // NOR (4 transistors):
+        // VDD ──┬──────────┐
+        // [PMOS,A]    [PMOS,B]  ← series
+        //    |           |
+        // [PMOS,B]
+        //    |
+        //   OUT
+        //    |
+        // [NMOS,A]    [NMOS,B]  ← parallel
+        //    |           |
+        //   GND ─────────┘
+        let out = self.add_signal(Some("OUT"));
+        let mid = self.add_signal(None);
+        let first = self.kinds.len();
+        self.add_transistor(TransistorKind::PMOS, a, self.vdd(), mid);
+        self.add_transistor(TransistorKind::PMOS, b, mid, out);
+        self.add_transistor(TransistorKind::NMOS, a, self.gnd(), out);
+        self.add_transistor(TransistorKind::NMOS, b, self.gnd(), out);
+        let last = self.kinds.len();
+
+        GateDescriptor {
+            output: out,
+            transistors: (first..last).collect(),
+        }
+    }
+
+    pub fn or(&mut self, a: SignalId, b: SignalId, small: bool) -> GateDescriptor {
+        // small=true: NOR + NOT (6 transistors)
+        // small=false: De Morgan's (8 transistors)
+        if small {
+            let nor = self.nor(a, b);
+            let not = self.not(nor.output);
+            GateDescriptor {
+                output: not.output,
+                transistors: nor.transistors.into_iter().chain(not.transistors).collect(),
+            }
+        } else {
+            let not_a = self.not(a);
+            let not_b = self.not(b);
+            let nand = self.nand(not_a.output, not_b.output);
+            GateDescriptor {
+                output: nand.output,
+                transistors: not_a
+                    .transistors
+                    .into_iter()
+                    .chain(not_b.transistors)
+                    .chain(nand.transistors)
+                    .collect(),
+            }
+        }
     }
 }

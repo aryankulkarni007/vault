@@ -14,12 +14,14 @@ pub struct SignalPanel<'a> {
 impl<'a> Widget for SignalPanel<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
-            .title("SIGNALS")
+            .title(Span::styled(
+                " SIGNALS ",
+                Style::default().fg(Color::Rgb(255, 200, 0)),
+            ))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(Color::Rgb(20, 60, 20)));
         let inner = block.inner(area);
         block.render(area, buf);
-
         self.graph
             .signals
             .iter()
@@ -37,7 +39,7 @@ impl<'a> Widget for SignalPanel<'a> {
                 let line = Line::from(vec![
                     Span::styled(
                         format!("{:<8}", name_str),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(Color::Rgb(255, 200, 0)),
                     ),
                     signal_span(*state),
                 ]);
