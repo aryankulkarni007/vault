@@ -351,4 +351,34 @@ impl SignalGraph {
             }
         }
     }
+
+    pub fn xor(&mut self, a: SignalId, b: SignalId) -> GateDescriptor {
+        let s1 = self.nand(a, b);
+        let s2 = self.nand(a, s1.output);
+        let s3 = self.nand(b, s1.output);
+        let xor = self.nand(s2.output, s3.output);
+        GateDescriptor {
+            output: xor.output,
+            transistors: s1
+                .transistors
+                .into_iter()
+                .chain(s2.transistors)
+                .chain(s3.transistors)
+                .chain(xor.transistors)
+                .collect(),
+        }
+    }
+
+    pub fn xnor(&mut self, a: SignalId, b: SignalId) -> GateDescriptor {
+        let xor = self.xor(a, b);
+        let xnor = self.not(xor.output);
+        GateDescriptor {
+            output: xnor.output,
+            transistors: xor
+                .transistors
+                .into_iter()
+                .chain(xnor.transistors)
+                .collect(),
+        }
+    }
 }

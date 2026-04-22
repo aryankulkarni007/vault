@@ -36,8 +36,8 @@ fn main() -> io::Result<()> {
     let a = signal_graph.add_signal(Some("A"));
     let b = signal_graph.add_signal(Some("B"));
 
-    let and = signal_graph.and(a, b);
-    let layout = layout_gate(&signal_graph, &and, "and");
+    let xnor = signal_graph.xnor(a, b);
+    let layout = layout_gate(&signal_graph, &xnor, "xnor");
     signal_graph.propagate();
 
     enable_raw_mode()?;
