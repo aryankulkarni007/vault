@@ -1,46 +1,23 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
-use ratatui::style::Style;
-use ratatui::text::Line;
-use ratatui::text::Span;
-use ratatui::widgets::Block;
-use ratatui::widgets::Borders;
-use ratatui::widgets::Widget;
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Widget};
 
-use crate::render::layout::find_clusters;
-use crate::sim::GateDescriptor;
-use crate::sim::SignalGraph;
-use crate::sim::SignalId;
-use crate::sim::SignalState;
-use crate::sim::TransistorKind;
+use crate::SignalGraph;
+use crate::SignalState;
+use crate::sim::transistor::{GateDescriptor, SignalId, TransistorKind};
 
-/* this file is ai as fuck - drawing logic is hard af */
-
-const TRANSISTOR_W: u16 = 4; // "[P] " or "[N] "
-const CELL_W: u16 = 12; // width per PMOS column
-const GATE_WIRE_W: u16 = 6; // space for gate label + wire "A ━━━━┤"
-const ROW_H: u16 = 2; // rows per transistor (node + wire below)
-
-const PCB_GREEN_DARK: Color = Color::Rgb(20, 60, 20); // Solder mask
-const PCB_GREEN_SILK: Color = Color::Rgb(40, 100, 40); // Traces (inactive)
-const ACCENT_GOLD: Color = Color::Rgb(255, 220, 80); // Exposed Copper/Gold
+const PCB_GREEN_DARK: Color = Color::Rgb(20, 60, 20);
+const PCB_GREEN_SILK: Color = Color::Rgb(40, 100, 40);
+const ACCENT_GOLD: Color = Color::Rgb(255, 220, 80);
 
 fn wire_style(state: SignalState) -> Style {
     match state {
-        SignalState::High => Style::default().fg(Color::Rgb(255, 220, 80)), // bright gold, live
+        SignalState::High => Style::default().fg(Color::Rgb(255, 220, 80)),
         SignalState::Low => Style::default().fg(Color::Rgb(20, 60, 20)),
         SignalState::Floating => Style::default().fg(Color::Rgb(20, 60, 20)),
-        SignalState::Conflict => Style::default().fg(Color::Rgb(255, 50, 50)), // red
-    }
-}
-
-fn wire_char(state: SignalState) -> &'static str {
-    match state {
-        SignalState::High => "━",
-        SignalState::Low => "╌",
-        SignalState::Floating => "─",
-        SignalState::Conflict => "▓",
+        SignalState::Conflict => Style::default().fg(Color::Rgb(255, 50, 50)),
     }
 }
 
@@ -78,7 +55,7 @@ impl<'a> Widget for TopologyWidget<'a> {
         let gold_style = Style::default().fg(ACCENT_GOLD);
         let silk_style = Style::default().fg(PCB_GREEN_SILK);
 
-        // 1. DYNAMIC FRAME COLOR
+        // dynamic frame color
         let border_color = if output_state == SignalState::High {
             ACCENT_GOLD
         } else {
@@ -100,7 +77,7 @@ impl<'a> Widget for TopologyWidget<'a> {
             return;
         }
 
-        // 2. CENTERING CALCULATIONS
+        // centering calculations
         let cluster_padding = 4;
         let cluster_widths: Vec<u16> = self
             .layout
@@ -116,12 +93,12 @@ impl<'a> Widget for TopologyWidget<'a> {
         let start_x = inner.x + (inner.width.saturating_sub(total_w) / 2);
         let start_y = inner.y + (inner.height.saturating_sub(total_h) / 2);
 
-        // 3. RENDER CLUSTERS
+        // render clusters
         let mut x_cursor = start_x;
         for (idx, cluster) in self.layout.clusters.iter().enumerate() {
             let width = cluster_widths[idx];
 
-            // Only render if within the frame's horizontal bounds
+            // only render if within the frame's horizontal bounds
             if x_cursor < inner.right() {
                 self.render_microscope_cell(buf, cluster, x_cursor, start_y, inner, width);
             }
@@ -140,7 +117,7 @@ impl<'a> TopologyWidget<'a> {
         limit: Rect,
         width: u16,
     ) {
-        // Local drawing helper with boundary clipping
+        // local drawing helper with boundary clipping
         let mut draw = |rx: u16, ry: u16, s: &str, style: Style| {
             let tx = origin_x + rx;
             let ty = origin_y + ry;
@@ -154,35 +131,33 @@ impl<'a> TopologyWidget<'a> {
         let gnd_s = wire_style(self.graph.signals[1]);
         let out_s = wire_style(self.graph.signals[cluster.output.0]);
 
-        // 1. DYNAMIC BOUNDARIES
-        // Instead of a fixed width, we find where the transistors actually start and end.
+        // dynamic boundaries
+        // instead of a fixed width, we find where the transistors actually start and end.
         let p_count = cluster.pmos.len() as u16;
-        let b_start = 2; // Fixed indent for the first transistor
-        let b_end = ((p_count.saturating_sub(1)) * 8) + 2; // Position of the last transistor
+        let b_start = 2;
+        let b_end = ((p_count.saturating_sub(1)) * 8) + 2;
 
-        let substrate_style = Style::default().fg(Color::Rgb(15, 35, 15)); // Deep, dark moss green
+        let substrate_style = Style::default().fg(Color::Rgb(15, 35, 15));
         for ry in 0..=8 {
             for rx in b_start..=b_end {
-                // Using a braille pattern for high-density "noise" texture
+                // using a braille pattern for high-density "noise" texture
                 draw(rx, ry, "⣿", substrate_style);
             }
         }
 
-        // --- 2. POWER RAILS (Clipped to Transistors) ---
+        // --- power rails (clipped to transistors) ---
         for x in b_start..=b_end {
             if x == b_start {
                 draw(x, 0, "┏", vdd_s);
-                draw(x, 8, "┗", gnd_s);
             } else if x == b_end {
                 draw(x, 0, "┓", vdd_s);
-                draw(x, 8, "┛", gnd_s);
             } else {
                 draw(x, 0, "━", vdd_s);
-                draw(x, 8, "━", gnd_s);
             }
+            draw(x, 8, "━", gnd_s);
         }
 
-        // --- 2. PMOS ARRAY (Pull-up) ---
+        // --- pmos array (pull-up) ---
         for (i, pmos) in cluster.pmos.iter().enumerate() {
             let px = (i as u16 * 8) + 2;
             let gate_s = wire_style(self.graph.signals[pmos.gate_signal.0]);
@@ -190,24 +165,25 @@ impl<'a> TopologyWidget<'a> {
                 .as_deref()
                 .unwrap_or("?");
 
+            draw(px, 0, "┳", vdd_s);
             draw(px, 1, "┃", vdd_s);
             draw(px - 1, 2, name, gate_s);
-            draw(px, 2, "║", gate_s); // Polysilicon Gate
+            draw(px, 2, "║", gate_s);
             draw(px + 1, 2, "P", out_s);
             draw(px, 3, "┃", out_s);
         }
 
-        // --- THE BRIDGE (Output Node) ---
+        // --- the bridge (output node) ---
         let bridge_y = 4;
         let b_start = 2;
         let b_end = ((cluster.pmos.len() as u16).saturating_sub(1) * 8) + 2;
 
-        // Draw the horizontal line
+        // draw the horizontal line
         for bx in b_start..=b_end {
             draw(bx, bridge_y, "━", out_s);
         }
 
-        // Draw the PMOS-to-Bridge connections
+        // draw the pmos-to-bridge connections
         for i in 0..cluster.pmos.len() as u16 {
             let px = (i * 8) + 2;
             if px == b_start {
@@ -215,17 +191,17 @@ impl<'a> TopologyWidget<'a> {
             } else if px == b_end {
                 draw(px, bridge_y, "┛", out_s); // Top-right corner
             } else {
-                draw(px, bridge_y, "┻", out_s); // T-junction for middle PMOS
+                draw(px, bridge_y, "┳", out_s); // T-junction for middle PMOS
             }
         }
 
-        // --- 4. NMOS STACK (Pull-down) ---
+        // --- nmos stack (pull-down) ---
         let nx = (b_start + b_end) / 2;
-        // Bridge to NMOS junction
+        // bridge to nmos junction
         draw(
             nx,
             bridge_y,
-            if cluster.pmos.len() > 1 { "┻" } else { "┃" },
+            if cluster.pmos.len() > 1 { "┳" } else { "┃" },
             out_s,
         );
 
@@ -244,7 +220,7 @@ impl<'a> TopologyWidget<'a> {
                 let mid_s = wire_style(self.graph.signals[nmos.vertical_out.0]);
                 draw(nx, ny + 1, "┃", mid_s);
             } else {
-                // Ground Connection with correct "Bottom T" junction
+                // ground connection with correct "bottom t" junction
                 draw(nx, ny + 1, "┃", gnd_s);
                 draw(nx, 8, "┻", gnd_s);
             }
@@ -310,13 +286,24 @@ fn layout_cluster(graph: &SignalGraph, transistors: &[usize]) -> ClusterLayout {
     }
 }
 
+/// recursively flats gates which have multiple sub gates
+fn collect_clusters(graph: &SignalGraph, descriptor: &GateDescriptor) -> Vec<ClusterLayout> {
+    match &descriptor.sub_gates {
+        None => {
+            let t = descriptor.transistors.as_ref().unwrap();
+            vec![layout_cluster(graph, t)]
+        }
+        Some(sub_gates) => sub_gates
+            .iter()
+            .flat_map(|sg| collect_clusters(graph, sg))
+            .collect(),
+    }
+}
+
 pub fn layout_gate(graph: &SignalGraph, descriptor: &GateDescriptor, label: &str) -> GateLayout {
-    let clusters = find_clusters(graph, &descriptor.transistors);
-    let cluster_layouts: Vec<ClusterLayout> =
-        clusters.iter().map(|c| layout_cluster(graph, c)).collect();
     GateLayout {
         label: label.to_string(),
-        clusters: cluster_layouts,
+        clusters: collect_clusters(graph, descriptor),
         output_signal: descriptor.output,
     }
 }

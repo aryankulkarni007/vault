@@ -1,4 +1,4 @@
-use crate::sim::SignalState;
+use crate::SignalState;
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
