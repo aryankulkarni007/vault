@@ -36,17 +36,18 @@ fn main() -> io::Result<()> {
     let a = signal_graph.add_signal(Some("A"));
     let b = signal_graph.add_signal(Some("B"));
 
-    let nor = signal_graph.nor(a, b);
-    let layout = layout_gate(&signal_graph, &nor, "nor");
+    let xor = signal_graph.xor(a, b);
+    let layout = layout_gate(&signal_graph, &xor, "XOR");
     signal_graph.propagate();
 
+    // rendering loop
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     loop {
         terminal.draw(|frame| {
-            let area = centered_rect(50, 70, frame.area());
+            let area = frame.area();
             frame.render_widget(
                 TopologyWidget {
                     graph: &signal_graph,
@@ -129,7 +130,6 @@ mod tests {
         let mut g = SignalGraph::new();
         let (a, b) = (g.add_signal(Some("A")), g.add_signal(Some("B")));
 
-        // 1. Pre-construct all gates to avoid multiple mutable borrows
         let not_out = g.not(a).output;
         let nand_out = g.nand(a, b).output;
         let and_out = g.and(a, b).output;
@@ -137,7 +137,6 @@ mod tests {
         let xor_out = g.xor(a, b).output;
         let xnor_out = g.xnor(a, b).output;
 
-        // 2. Run checks
         check(&mut g, "NOT", &[a], not_out, &[High, Low]);
         check(&mut g, "NAND", &[a, b], nand_out, &[High, High, High, Low]);
         check(&mut g, "AND", &[a, b], and_out, &[Low, Low, Low, High]);

@@ -15,10 +15,16 @@ use crate::sim::SignalId;
 use crate::sim::SignalState;
 use crate::sim::TransistorKind;
 
+/* this file is ai as fuck - drawing logic is hard af */
+
 const TRANSISTOR_W: u16 = 4; // "[P] " or "[N] "
 const CELL_W: u16 = 12; // width per PMOS column
 const GATE_WIRE_W: u16 = 6; // space for gate label + wire "A ━━━━┤"
 const ROW_H: u16 = 2; // rows per transistor (node + wire below)
+
+const PCB_GREEN_DARK: Color = Color::Rgb(20, 60, 20); // Solder mask
+const PCB_GREEN_SILK: Color = Color::Rgb(40, 100, 40); // Traces (inactive)
+const ACCENT_GOLD: Color = Color::Rgb(255, 220, 80); // Exposed Copper/Gold
 
 fn wire_style(state: SignalState) -> Style {
     match state {
@@ -38,6 +44,7 @@ fn wire_char(state: SignalState) -> &'static str {
     }
 }
 
+#[derive(Clone)]
 pub struct TransistorNode {
     pub id: usize,
     pub col: u16,
@@ -67,148 +74,181 @@ pub struct TopologyWidget<'a> {
 
 impl<'a> Widget for TopologyWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // STATE & STYLING PREP
         let output_state = self.graph.signals[self.layout.output_signal.0];
-        let border_color = wire_style(output_state);
-        let title_style = Style::default().fg(Color::Rgb(255, 200, 0));
+        let gold_style = Style::default().fg(ACCENT_GOLD);
+        let silk_style = Style::default().fg(PCB_GREEN_SILK);
 
-        // BLOCK RENDER
-        // We use a Line to mix styles: border characters inherit block style, text is gold.
+        // 1. DYNAMIC FRAME COLOR
+        let border_color = if output_state == SignalState::High {
+            ACCENT_GOLD
+        } else {
+            PCB_GREEN_DARK
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(border_color)
+            .border_style(Style::default().fg(border_color))
             .title(Line::from(vec![
-                Span::raw("─ "),
-                Span::styled(self.layout.label.to_uppercase(), title_style),
-                Span::raw(" "),
+                Span::styled(" SEM_SCAN // ", silk_style),
+                Span::styled(self.layout.label.to_uppercase(), gold_style.bold()),
             ]));
 
-        // calculate the inner area
         let inner = block.inner(area);
         block.render(area, buf);
 
-        // if the window is too tiny to even show the inner area, abort to prevent panics.
-        if inner.width == 0 || inner.height == 0 {
+        if inner.width < 10 || inner.height < 10 {
             return;
         }
 
-        // 3. DIMENSION CALCULATION
-        // Partition nodes once to avoid multiple filter/iter passes
-        let (pmos_nodes, nmos_nodes): (Vec<_>, Vec<_>) = self
+        // 2. CENTERING CALCULATIONS
+        let cluster_padding = 4;
+        let cluster_widths: Vec<u16> = self
             .layout
-            .nodes
+            .clusters
             .iter()
-            .partition(|n| n.kind == TransistorKind::PMOS);
+            .map(|c| (c.pmos.len() as u16 * 8).max(12))
+            .collect();
 
-        let p_count = pmos_nodes.len() as u16;
-        let n_count = nmos_nodes.len() as u16;
+        let total_w: u16 = cluster_widths.iter().sum::<u16>()
+            + (cluster_widths.len().saturating_sub(1) as u16 * cluster_padding);
+        let total_h = 9; // Rails + PMOS + Bridge + NMOS stack space
 
-        // content width: space for gate labels + width of all pmos columns
-        let content_w = GATE_WIRE_W + (p_count.max(1) * CELL_W);
-        // content height: vdd + gap + pmos + merge + (nmos stack) + gnd
-        let content_h = 4 + (n_count * ROW_H) + 1;
+        let start_x = inner.x + (inner.width.saturating_sub(total_w) / 2);
+        let start_y = inner.y + (inner.height.saturating_sub(total_h) / 2);
 
-        // CENTERING & CLIPPING LOGIC
-        // we calculate offsets relative to 'inner' area.
-        let offset_x = inner.x + inner.width.saturating_sub(content_w) / 2;
-        let offset_y = inner.y + inner.height.saturating_sub(content_h) / 2;
+        // 3. RENDER CLUSTERS
+        let mut x_cursor = start_x;
+        for (idx, cluster) in self.layout.clusters.iter().enumerate() {
+            let width = cluster_widths[idx];
 
-        // boundary check helper: prevents writing outside the widget's allocated area.
-        let mut draw = |x_rel: u16, y_rel: u16, text: &str, style: Style| {
-            let abs_x = offset_x + x_rel;
-            let abs_y = offset_y + y_rel;
-            if abs_x < inner.right() && abs_y < inner.bottom() {
-                buf.set_string(abs_x, abs_y, text, style);
+            // Only render if within the frame's horizontal bounds
+            if x_cursor < inner.right() {
+                self.render_microscope_cell(buf, cluster, x_cursor, start_y, inner, width);
+            }
+            x_cursor += width + cluster_padding;
+        }
+    }
+}
+
+impl<'a> TopologyWidget<'a> {
+    fn render_microscope_cell(
+        &self,
+        buf: &mut Buffer,
+        cluster: &ClusterLayout,
+        origin_x: u16,
+        origin_y: u16,
+        limit: Rect,
+        width: u16,
+    ) {
+        // Local drawing helper with boundary clipping
+        let mut draw = |rx: u16, ry: u16, s: &str, style: Style| {
+            let tx = origin_x + rx;
+            let ty = origin_y + ry;
+            if tx >= limit.left() && tx < limit.right() && ty >= limit.top() && ty < limit.bottom()
+            {
+                buf.set_string(tx, ty, s, style);
             }
         };
 
-        // 5. DRAW VDD RAIL
-        let vdd_state = self.graph.signals[0];
-        let vdd_s = wire_style(vdd_state);
-        let v_char = wire_char(vdd_state);
-        let vdd_label = " VDD ";
-        let v_rail_len = (content_w.saturating_sub(vdd_label.len() as u16)) / 2;
-        let vdd_line = format!(
-            "{}{}{}",
-            v_char.repeat(v_rail_len as usize),
-            vdd_label,
-            v_char.repeat(v_rail_len as usize)
-        );
-        draw(0, 0, &vdd_line, vdd_s);
+        let vdd_s = wire_style(self.graph.signals[0]);
+        let gnd_s = wire_style(self.graph.signals[1]);
+        let out_s = wire_style(self.graph.signals[cluster.output.0]);
 
-        // DRAW PMOS ARRAY (Top)
-        let pmos_y = 2;
-        for node in &pmos_nodes {
-            let x = GATE_WIRE_W + node.col * CELL_W;
-            let gate_s = wire_style(self.graph.signals[node.gate_signal.0]);
-            let out_s = wire_style(self.graph.signals[node.vertical_out.0]);
-            let name = self.graph.signal_names[node.gate_signal.0]
-                .as_deref()
-                .unwrap_or("?");
+        // 1. DYNAMIC BOUNDARIES
+        // Instead of a fixed width, we find where the transistors actually start and end.
+        let p_count = cluster.pmos.len() as u16;
+        let b_start = 2; // Fixed indent for the first transistor
+        let b_end = ((p_count.saturating_sub(1)) * 8) + 2; // Position of the last transistor
 
-            draw(
-                x - GATE_WIRE_W,
-                pmos_y,
-                &format!("{:<2} ━━━┤", name),
-                gate_s,
-            );
-            draw(x, pmos_y, "[P]", out_s);
-            draw(x + 1, pmos_y + 1, "┃", out_s);
-        }
-
-        // 7. DRAW MERGE BAR & OUTPUT
-        let merge_y = pmos_y + 2;
-        let out_s = wire_style(output_state);
-        let merge_start = GATE_WIRE_W + 1;
-        let merge_end = GATE_WIRE_W + (p_count.saturating_sub(1) * CELL_W) + 1;
-
-        for mx in merge_start..=merge_end {
-            draw(mx, merge_y, "─", out_s);
-        }
-        draw(merge_start, merge_y, "└", out_s);
-        draw(merge_end, merge_y, "┘", out_s);
-
-        let mid_x = (merge_start + merge_end) / 2;
-        draw(mid_x, merge_y, "┬", out_s);
-        draw(mid_x, merge_y + 1, "┃ OUT", out_s);
-
-        // 8. DRAW NMOS STACK (Bottom)
-        let nmos_start_y = merge_y + 2;
-        for (i, node) in nmos_nodes.iter().enumerate() {
-            let y = nmos_start_y + (i as u16 * ROW_H);
-            let gate_s = wire_style(self.graph.signals[node.gate_signal.0]);
-            let name = self.graph.signal_names[node.gate_signal.0]
-                .as_deref()
-                .unwrap_or("?");
-
-            draw(
-                mid_x - GATE_WIRE_W,
-                y,
-                &format!("{:<2} ╌╌╌╌┤", name),
-                gate_s,
-            );
-            draw(mid_x, y, "[N]", gate_s);
-
-            // Only draw vertical connector if there's another transistor below
-            if (i as u16) < n_count - 1 {
-                let v_out_s = wire_style(self.graph.signals[node.vertical_out.0]);
-                draw(mid_x, y + 1, "┃", v_out_s);
+        let substrate_style = Style::default().fg(Color::Rgb(15, 35, 15)); // Deep, dark moss green
+        for ry in 0..=8 {
+            for rx in b_start..=b_end {
+                // Using a braille pattern for high-density "noise" texture
+                draw(rx, ry, "⣿", substrate_style);
             }
         }
 
-        // 9. DRAW GND RAIL
-        let gnd_state = self.graph.signals[1];
-        let gnd_s = wire_style(gnd_state);
-        let g_char = wire_char(gnd_state);
-        let gnd_label = " GND ";
-        let g_rail_len = (content_w.saturating_sub(gnd_label.len() as u16)) / 2;
-        let gnd_line = format!(
-            "{}{}{}",
-            g_char.repeat(g_rail_len as usize),
-            gnd_label,
-            g_char.repeat(g_rail_len as usize)
+        // --- 2. POWER RAILS (Clipped to Transistors) ---
+        for x in b_start..=b_end {
+            if x == b_start {
+                draw(x, 0, "┏", vdd_s);
+                draw(x, 8, "┗", gnd_s);
+            } else if x == b_end {
+                draw(x, 0, "┓", vdd_s);
+                draw(x, 8, "┛", gnd_s);
+            } else {
+                draw(x, 0, "━", vdd_s);
+                draw(x, 8, "━", gnd_s);
+            }
+        }
+
+        // --- 2. PMOS ARRAY (Pull-up) ---
+        for (i, pmos) in cluster.pmos.iter().enumerate() {
+            let px = (i as u16 * 8) + 2;
+            let gate_s = wire_style(self.graph.signals[pmos.gate_signal.0]);
+            let name = self.graph.signal_names[pmos.gate_signal.0]
+                .as_deref()
+                .unwrap_or("?");
+
+            draw(px, 1, "┃", vdd_s);
+            draw(px - 1, 2, name, gate_s);
+            draw(px, 2, "║", gate_s); // Polysilicon Gate
+            draw(px + 1, 2, "P", out_s);
+            draw(px, 3, "┃", out_s);
+        }
+
+        // --- THE BRIDGE (Output Node) ---
+        let bridge_y = 4;
+        let b_start = 2;
+        let b_end = ((cluster.pmos.len() as u16).saturating_sub(1) * 8) + 2;
+
+        // Draw the horizontal line
+        for bx in b_start..=b_end {
+            draw(bx, bridge_y, "━", out_s);
+        }
+
+        // Draw the PMOS-to-Bridge connections
+        for i in 0..cluster.pmos.len() as u16 {
+            let px = (i * 8) + 2;
+            if px == b_start {
+                draw(px, bridge_y, "┗", out_s); // Top-left corner
+            } else if px == b_end {
+                draw(px, bridge_y, "┛", out_s); // Top-right corner
+            } else {
+                draw(px, bridge_y, "┻", out_s); // T-junction for middle PMOS
+            }
+        }
+
+        // --- 4. NMOS STACK (Pull-down) ---
+        let nx = (b_start + b_end) / 2;
+        // Bridge to NMOS junction
+        draw(
+            nx,
+            bridge_y,
+            if cluster.pmos.len() > 1 { "┻" } else { "┃" },
+            out_s,
         );
-        draw(0, content_h - 1, &gnd_line, gnd_s);
+
+        for (i, nmos) in cluster.nmos.iter().enumerate() {
+            let ny = 5 + (i as u16 * 2);
+            let gate_s = wire_style(self.graph.signals[nmos.gate_signal.0]);
+            let name = self.graph.signal_names[nmos.gate_signal.0]
+                .as_deref()
+                .unwrap_or("?");
+
+            draw(nx - 1, ny, name, gate_s);
+            draw(nx, ny, "║", gate_s);
+            draw(nx + 1, ny, "N", gate_s);
+
+            if i < cluster.nmos.len() - 1 {
+                let mid_s = wire_style(self.graph.signals[nmos.vertical_out.0]);
+                draw(nx, ny + 1, "┃", mid_s);
+            } else {
+                // Ground Connection with correct "Bottom T" junction
+                draw(nx, ny + 1, "┃", gnd_s);
+                draw(nx, 8, "┻", gnd_s);
+            }
+        }
     }
 }
 
