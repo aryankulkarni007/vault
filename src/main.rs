@@ -13,30 +13,14 @@ mod sim;
 use crate::render::topology::{TopologyWidget, layout_gate};
 use crate::sim::transistor::{SignalGraph, SignalState};
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vert = Layout::vertical([
-        Constraint::Percentage((100 - percent_y) / 2),
-        Constraint::Percentage(percent_y),
-        Constraint::Percentage((100 - percent_y) / 2),
-    ])
-    .split(area);
-
-    Layout::horizontal([
-        Constraint::Percentage((100 - percent_x) / 2),
-        Constraint::Percentage(percent_x),
-        Constraint::Percentage((100 - percent_x) / 2),
-    ])
-    .split(vert[1])[1]
-}
-
 fn main() -> io::Result<()> {
     // initialisation of the circuit
     let mut signal_graph = SignalGraph::new();
     let a = signal_graph.add_signal(Some("A"));
     let b = signal_graph.add_signal(Some("B"));
 
-    let nand = signal_graph.nand(a, b);
-    let layout = layout_gate(&signal_graph, &nand, "nand");
+    let xnor = signal_graph.xnor(a, b);
+    let layout = layout_gate(&signal_graph, &xnor, "XNOR");
     signal_graph.propagate();
 
     // rendering loop
@@ -243,5 +227,28 @@ mod tests {
         assert_eq!(g.signals[adder.outputs[2].0], Low, "sum bit 2");
         assert_eq!(g.signals[adder.outputs[3].0], Low, "sum bit 3");
         assert_eq!(g.signals[adder.outputs[4].0], High, "cout");
+    }
+
+    #[test]
+    fn test_mux() {
+        let mut g = SignalGraph::new();
+        let mut s = Schematic::new();
+        let a = g.add_signal(Some("A"));
+        let b = g.add_signal(Some("B"));
+        let sel = g.add_signal(Some("SEL"));
+        let mux = s.mux(&mut g, a, b, sel);
+        let out = mux.outputs[0];
+        // sel=Low → output follows a
+        g.drive(sel, Some(Low));
+        check(&mut g, "MUX_SEL_LOW", &[a, b], out, &[Low, Low, High, High]);
+        // sel=High → output follows b
+        g.drive(sel, Some(High));
+        check(
+            &mut g,
+            "MUX_SEL_HIGH",
+            &[a, b],
+            out,
+            &[Low, High, Low, High],
+        );
     }
 }

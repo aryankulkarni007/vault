@@ -109,4 +109,25 @@ impl Schematic {
             children: vec![ad1, ad2, ad3, ad4],
         }
     }
+
+    pub fn mux(
+        &mut self,
+        graph: &mut SignalGraph,
+        a: SignalId,
+        b: SignalId,
+        sel: SignalId,
+    ) -> UnitDescriptor {
+        let not_sel = graph.not(sel);
+        let a_gate = graph.and(a, not_sel.output);
+        let b_gate = graph.and(b, sel);
+        let out = graph.or(a_gate.output, b_gate.output, true);
+        UnitDescriptor {
+            name: "MUX".to_string(),
+            kind: UnitKind::Composite,
+            inputs: vec![a, b, sel],
+            outputs: vec![out.output],
+            gates: vec![not_sel, a_gate, b_gate, out],
+            children: vec![],
+        }
+    }
 }
