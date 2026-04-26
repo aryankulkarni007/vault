@@ -1,7 +1,7 @@
 use crate::sim::gate::GateKind;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::vec;
 
 /// index for signals
 #[derive(Clone, Copy, PartialEq, Debug, Eq, Hash)]
@@ -11,12 +11,12 @@ pub struct SignalId(pub usize);
 pub enum SignalState {
     High,
     Low,
-    Floating, // undriven wire (power on, but not yet initalised state)
-    Conflict, // two drivers fighting - short circuit (visual needed)
+    Floating,
+    Conflict,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub struct TransistorId(usize);
+pub struct TransistorId(pub usize);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum TransistorKind {
@@ -26,41 +26,10 @@ pub enum TransistorKind {
 
 #[derive(Clone)]
 pub struct CapacitorState {
-    pub charge: u8,     // current charge level (0 to period)
-    pub threshold: u8,  // crossing point where output flips
-    pub period: u8,     // total ticks for a full charge/discharge half-cycle
-    pub charging: bool, // true = charging up, false = discharging down
-}
-
-impl SignalGraph {
-    pub fn tick(&mut self) {
-        for (sid, cap_opt) in self.capacitors.iter_mut().enumerate() {
-            if let Some(cap) = cap_opt {
-                if cap.charging {
-                    cap.charge += 1;
-                    if cap.charge >= cap.period {
-                        cap.charging = false;
-                    }
-                } else {
-                    if cap.charge > 0 {
-                        cap.charge -= 1;
-                    }
-                    if cap.charge == 0 {
-                        cap.charging = true;
-                    }
-                }
-                let state = if cap.charge >= cap.threshold {
-                    SignalState::High
-                } else {
-                    SignalState::Low
-                };
-                self.signals[sid] = state;
-                self.driven[sid] = Some(state);
-            }
-        }
-        self.cycle_count += 1;
-        self.propagate();
-    }
+    pub charge: u8,
+    pub threshold: u8,
+    pub period: u8,
+    pub charging: bool,
 }
 
 pub struct SignalGraph {
@@ -68,18 +37,18 @@ pub struct SignalGraph {
     pub signals: Vec<SignalState>,
     pub driven: Vec<Option<SignalState>>,
     pub signal_names: Vec<Option<String>>,
+    pub sequential: Vec<SignalId>, // signals that persist state across propagations
     // transistor data
     pub kinds: Vec<TransistorKind>,
     pub gates: Vec<SignalId>,
     pub sources: Vec<SignalId>,
     pub drains: Vec<SignalId>,
-    pub eval_order: Vec<TransistorId>, // for kahn's algorithm,
-    pub dirty: bool,                   // for lazy re-eval
+    pub eval_order: Vec<TransistorId>,
+    pub dirty: bool,
     pub capacitors: Vec<Option<CapacitorState>>,
-    pub cycle_count: u64, // increment in tick()
+    pub cycle_count: u64,
 }
 
-/// for visualisation
 pub struct GateDescriptor {
     pub kind: GateKind,
     pub inputs: Vec<SignalId>,
@@ -89,18 +58,14 @@ pub struct GateDescriptor {
 }
 
 impl SignalGraph {
-    /// sets up signal graph initial state
-    /// push vdd and gnd into 'signals'
     pub fn new() -> Self {
         let vdd = SignalState::High;
         let gnd = SignalState::Low;
-        let signals = vec![vdd, gnd];
-        let driven = vec![Some(vdd), Some(gnd)];
-        let signal_names = vec![Some("VDD".to_string()), Some("GND".to_string())];
         SignalGraph {
-            signals,
-            driven,
-            signal_names,
+            signals: vec![vdd, gnd],
+            driven: vec![Some(vdd), Some(gnd)],
+            signal_names: vec![Some("VDD".to_string()), Some("GND".to_string())],
+            sequential: Vec::new(),
             kinds: Vec::new(),
             gates: Vec::new(),
             sources: Vec::new(),
@@ -112,7 +77,6 @@ impl SignalGraph {
         }
     }
 
-    /// adds floating signal -> signal id
     pub fn add_signal(&mut self, name: Option<&str>) -> SignalId {
         let id = SignalId(self.signals.len());
         self.signals.push(SignalState::Floating);
@@ -122,7 +86,13 @@ impl SignalGraph {
         id
     }
 
-    /// connects the gate, source and the drain and pushes transistor
+    /// signal that persists state across propagations (Q, !Q, register outputs)
+    pub fn add_sequential_signal(&mut self, name: Option<&str>) -> SignalId {
+        let id = self.add_signal(name);
+        self.sequential.push(id);
+        id
+    }
+
     pub fn add_transistor(
         &mut self,
         kind: TransistorKind,
@@ -157,26 +127,26 @@ impl SignalGraph {
         self.driven[id.0] = state;
     }
 
-    /// (signal graph -> dependents, in_degree -> eval_order)
+    pub fn vdd(&self) -> SignalId {
+        SignalId(0)
+    }
+    pub fn gnd(&self) -> SignalId {
+        SignalId(1)
+    }
+
     fn kahn(&mut self) {
-        // step 1: build a hashmap that stores the gates at a specific signal
         let signal_to_transistors = self.gates.iter().enumerate().fold(
             HashMap::new(),
-            |mut map: HashMap<usize, Vec<usize>>,
-             (transistor_idx, signal_id): (usize, &SignalId)| {
-                // for each pair, push transistor_idx to map[signal_id]
-                map.entry(signal_id.0).or_default().push(transistor_idx);
+            |mut map: HashMap<usize, Vec<usize>>, (t_idx, sig_id)| {
+                map.entry(sig_id.0).or_default().push(t_idx);
                 map
             },
         );
 
-        // step 2
         let n = self.kinds.len();
         let (dependents, mut in_degree) = self.drains.iter().enumerate().fold(
             (vec![vec![]; n], vec![0usize; n]),
             |mut acc, (i, drain_signal)| {
-                // reindex the signal_to_transistors vec to be
-                // indexed by transistor instead of signl
                 acc.0[i] = signal_to_transistors
                     .get(&drain_signal.0)
                     .cloned()
@@ -186,25 +156,26 @@ impl SignalGraph {
             },
         );
 
-        // merged compute eval_order from here
         self.eval_order.clear();
-        let mut eval_queue: VecDeque<usize> = in_degree
+        let mut queue: VecDeque<usize> = in_degree
             .iter()
             .enumerate()
-            .filter(|x| *x.1 == 0)
+            .filter(|&(_idx, &degree)| degree == 0)
             .map(|(i, _)| i)
             .collect();
-        while let Some(i) = eval_queue.pop_front() {
+
+        while let Some(i) = queue.pop_front() {
             self.eval_order.push(TransistorId(i));
-            dependents[i].iter().for_each(|j| {
-                in_degree[*j] -= 1;
-                if in_degree[*j] == 0 {
-                    eval_queue.push_back(*j);
+            for &j in &dependents[i] {
+                in_degree[j] -= 1;
+                if in_degree[j] == 0 {
+                    queue.push_back(j);
                 }
-            });
+            }
         }
+
         if self.eval_order.len() < self.kinds.len() {
-            println!("cycles exist");
+            // cycles exist — sequential circuit
         }
         self.dirty = false;
     }
@@ -212,44 +183,72 @@ impl SignalGraph {
     fn resolve(a: SignalState, b: SignalState) -> SignalState {
         match (a, b) {
             (SignalState::High, SignalState::High) => SignalState::High,
-            (SignalState::High, SignalState::Low) => SignalState::Conflict,
-            (SignalState::High, SignalState::Floating) => SignalState::High,
-            (SignalState::Low, SignalState::High) => SignalState::Conflict,
             (SignalState::Low, SignalState::Low) => SignalState::Low,
+            (SignalState::High, SignalState::Floating) => SignalState::High,
             (SignalState::Low, SignalState::Floating) => SignalState::Low,
             (SignalState::Floating, SignalState::High) => SignalState::High,
             (SignalState::Floating, SignalState::Low) => SignalState::Low,
             (SignalState::Floating, SignalState::Floating) => SignalState::Floating,
+            (SignalState::High, SignalState::Low) => SignalState::Conflict,
+            (SignalState::Low, SignalState::High) => SignalState::Conflict,
             (_, SignalState::Conflict) => SignalState::Conflict,
             (SignalState::Conflict, _) => SignalState::Conflict,
         }
     }
 
-    /// evaluate the transistors; rebuilds the graph if changed
     pub fn propagate(&mut self) {
         if self.dirty {
             self.kahn();
         }
 
-        // Reset all non-driven signals to Floating
+        let eval_set: HashSet<usize> = self.eval_order.iter().map(|t| t.0).collect();
+        let has_cycles = eval_set.len() < self.kinds.len();
+
+        // build sequential set for O(1) lookup
+        let sequential_set: HashSet<usize> = self.sequential.iter().map(|s| s.0).collect();
+
+        // reset phase: sequential signals preserve state, everything else floats
         for i in 0..self.signals.len() {
             if let Some(state) = self.driven[i] {
                 self.signals[i] = state;
-            } else {
+            } else if !sequential_set.contains(&i) {
                 self.signals[i] = SignalState::Floating;
             }
+            // sequential non-driven signals keep current value
         }
 
-        let mut iterations = 0;
-        let max_iterations = self.kinds.len() * 100; // debug
+        // build full eval order: topo-sorted first, cyclic remainder after — O(n)
+        let mut in_order = Vec::with_capacity(self.kinds.len());
+        let mut remainder = Vec::new();
+        for i in 0..self.kinds.len() {
+            if eval_set.contains(&i) {
+                in_order.push(i);
+            } else {
+                remainder.push(i);
+            }
+        }
+        // eval_order is already topo-sorted, use it directly
+        let full_order: Vec<usize> = self
+            .eval_order
+            .iter()
+            .map(|&TransistorId(i)| i)
+            .chain(remainder)
+            .collect();
 
+        let max_iterations = if has_cycles {
+            self.kinds.len() * 4
+        } else {
+            self.kinds.len() + 1
+        };
+
+        let mut iterations = 0;
         loop {
             let prev = self.signals.clone();
-            for transistor_idx in 0..self.kinds.len() {
-                let kind = self.kinds[transistor_idx];
-                let gate = self.gates[transistor_idx].0;
-                let source = self.sources[transistor_idx].0;
-                let drain = self.drains[transistor_idx].0;
+            for &t_idx in &full_order {
+                let kind = self.kinds[t_idx];
+                let gate = self.gates[t_idx].0;
+                let source = self.sources[t_idx].0;
+                let drain = self.drains[t_idx].0;
 
                 let conducting = match kind {
                     TransistorKind::NMOS => self.signals[gate] == SignalState::High,
@@ -257,9 +256,21 @@ impl SignalGraph {
                 };
 
                 if conducting {
-                    let resolved = SignalGraph::resolve(self.signals[source], self.signals[drain]);
-                    self.signals[source] = resolved;
-                    self.signals[drain] = resolved;
+                    let src_driven = self.driven[source].is_some();
+                    let drn_driven = self.driven[drain].is_some();
+                    if src_driven && !drn_driven {
+                        self.signals[drain] = self.signals[source];
+                    } else if drn_driven && !src_driven {
+                        self.signals[source] = self.signals[drain];
+                    } else {
+                        let resolved = Self::resolve(self.signals[source], self.signals[drain]);
+                        if !src_driven {
+                            self.signals[source] = resolved;
+                        }
+                        if !drn_driven {
+                            self.signals[drain] = resolved;
+                        }
+                    }
                 }
             }
             iterations += 1;
@@ -268,7 +279,7 @@ impl SignalGraph {
             }
         }
 
-        // Re-apply external drives
+        // re-apply drives — always win
         for i in 0..self.signals.len() {
             if let Some(state) = self.driven[i] {
                 self.signals[i] = state;
@@ -276,28 +287,38 @@ impl SignalGraph {
         }
     }
 
-    pub fn vdd(&self) -> SignalId {
-        SignalId(0)
-    }
-    pub fn gnd(&self) -> SignalId {
-        SignalId(1)
+    pub fn tick(&mut self) {
+        for (sid, cap_opt) in self.capacitors.iter_mut().enumerate() {
+            if let Some(cap) = cap_opt {
+                if cap.charging {
+                    cap.charge += 1;
+                    if cap.charge >= cap.period {
+                        cap.charging = false;
+                    }
+                } else {
+                    if cap.charge > 0 {
+                        cap.charge -= 1;
+                    }
+                    if cap.charge == 0 {
+                        cap.charging = true;
+                    }
+                }
+                let state = if cap.charge >= cap.threshold {
+                    SignalState::High
+                } else {
+                    SignalState::Low
+                };
+                self.signals[sid] = state;
+                self.driven[sid] = Some(state);
+            }
+        }
+        self.cycle_count += 1;
+        self.propagate();
     }
 }
 
-// logic gates
 impl SignalGraph {
     pub fn nand(&mut self, a: SignalId, b: SignalId) -> GateDescriptor {
-        // VDD ──┬──────────┐            nand architecture
-        // [PMOS_1,A] [PMOS_2,B]
-        //    └──────────┘
-        //         |
-        //        OUT
-        //         |
-        //    [NMOS_1,A]
-        //         |
-        //    [NMOS_2,B]
-        //         |
-        //        GND
         let out = self.add_signal(Some("OUT"));
         let mid = self.add_signal(None);
         let first = self.kinds.len();
@@ -306,7 +327,6 @@ impl SignalGraph {
         self.add_transistor(TransistorKind::NMOS, a, mid, out);
         self.add_transistor(TransistorKind::NMOS, b, self.gnd(), mid);
         let last = self.kinds.len();
-
         GateDescriptor {
             kind: GateKind::NAND,
             inputs: vec![a, b],
@@ -317,21 +337,11 @@ impl SignalGraph {
     }
 
     pub fn not(&mut self, a: SignalId) -> GateDescriptor {
-        // VDD           not architecture
-        //  |
-        // [PMOS, A]
-        //  |
-        // OUT
-        //  |
-        // [NMOS, A]
-        //  |
-        // GND
         let out = self.add_signal(Some("OUT"));
         let first = self.kinds.len();
         self.add_transistor(TransistorKind::PMOS, a, self.vdd(), out);
         self.add_transistor(TransistorKind::NMOS, a, self.gnd(), out);
         let last = self.kinds.len();
-
         GateDescriptor {
             kind: GateKind::NOT,
             inputs: vec![a],
@@ -342,10 +352,8 @@ impl SignalGraph {
     }
 
     pub fn and(&mut self, a: SignalId, b: SignalId) -> GateDescriptor {
-        // AND (NAND + NOT = 6 transistors)
         let nand = self.nand(a, b);
         let not = self.not(nand.output);
-
         GateDescriptor {
             kind: GateKind::AND,
             inputs: vec![a, b],
@@ -356,17 +364,6 @@ impl SignalGraph {
     }
 
     pub fn nor(&mut self, a: SignalId, b: SignalId) -> GateDescriptor {
-        // NOR (4 transistors):
-        // VDD ──┬──────────┐
-        // [PMOS,A]    [PMOS,B]  ← series
-        //    |           |
-        // [PMOS,B]
-        //    |
-        //   OUT
-        //    |
-        // [NMOS,A]    [NMOS,B]  ← parallel
-        //    |           |
-        //   GND ─────────┘
         let out = self.add_signal(Some("OUT"));
         let mid = self.add_signal(None);
         let first = self.kinds.len();
@@ -375,7 +372,6 @@ impl SignalGraph {
         self.add_transistor(TransistorKind::NMOS, a, self.gnd(), out);
         self.add_transistor(TransistorKind::NMOS, b, self.gnd(), out);
         let last = self.kinds.len();
-
         GateDescriptor {
             kind: GateKind::NOR,
             inputs: vec![a, b],
@@ -386,8 +382,6 @@ impl SignalGraph {
     }
 
     pub fn or(&mut self, a: SignalId, b: SignalId, small: bool) -> GateDescriptor {
-        // small=true: NOR + NOT (6 transistors)
-        // small=false: De Morgan's (8 transistors)
         if small {
             let nor = self.nor(a, b);
             let not = self.not(nor.output);

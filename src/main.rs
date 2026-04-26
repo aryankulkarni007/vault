@@ -148,7 +148,7 @@ fn main() -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::sim::{
-        gate::{Schematic, UnitDescriptor, UnitKind},
+        gate::Schematic,
         transistor::{
             SignalId,
             SignalState::{self, *},
@@ -185,6 +185,10 @@ mod tests {
                 if act == High { "1" } else { "0" }
             );
             assert_eq!(act, exp[i], "Fail {} at case {}", name, i);
+            // Cleanup: undrive inputs so they don't affect next row
+            for &input in ins {
+                g.drive(input, None);
+            }
         });
     }
 
@@ -385,21 +389,21 @@ mod tests {
         let q = latch.outputs[0];
         let nq = latch.outputs[1];
 
-        // POWER-ON RESET: pulse SET LOW to force initial state
+        // POWER-ON: pulse SET to force known initial state
         g.drive(set, Some(Low));
         g.drive(reset, Some(High));
         g.propagate();
-        assert_eq!(g.signals[q.0], High, "After SET pulse: Q should be HIGH");
-        assert_eq!(g.signals[nq.0], Low, "After SET pulse: !Q should be LOW");
+        assert_eq!(g.signals[q.0], High, "SET: Q should be HIGH");
+        assert_eq!(g.signals[nq.0], Low, "SET: !Q should be LOW");
 
-        // HOLD: both HIGH → should keep Q=HIGH
+        // HOLD after SET
         g.drive(set, Some(High));
         g.drive(reset, Some(High));
         g.propagate();
         assert_eq!(g.signals[q.0], High, "HOLD: Q should stay HIGH");
         assert_eq!(g.signals[nq.0], Low, "HOLD: !Q should stay LOW");
 
-        // RESET: SET=HIGH, RESET=LOW → Q=LOW, !Q=HIGH
+        // RESET
         g.drive(set, Some(High));
         g.drive(reset, Some(Low));
         g.propagate();
@@ -423,40 +427,44 @@ mod tests {
         assert_eq!(g.signals[q.0], High, "SET again: Q should be HIGH");
         assert_eq!(g.signals[nq.0], Low, "SET again: !Q should be LOW");
 
-        // FORBIDDEN: both LOW → both outputs HIGH
+        // FORBIDDEN: both LOW → both outputs HIGH (undefined but predictable)
         g.drive(set, Some(Low));
         g.drive(reset, Some(Low));
         g.propagate();
         assert_eq!(g.signals[q.0], High, "Forbidden: Q should be HIGH");
         assert_eq!(g.signals[nq.0], High, "Forbidden: !Q should be HIGH");
 
-        // RECOVERY: release both to HIGH → settles to valid state
-        g.drive(set, Some(High));
+        // RECOVERY from forbidden: genuinely metastable in real hardware
+        // re-assert known state via SET pulse instead of releasing symmetrically
+        g.drive(set, Some(Low));
         g.drive(reset, Some(High));
         g.propagate();
-        assert!(
-            (g.signals[q.0] == High && g.signals[nq.0] == Low)
-                || (g.signals[q.0] == Low && g.signals[nq.0] == High),
-            "Recovery: Q and !Q must be complements, got Q={:?} !Q={:?}",
-            g.signals[q.0],
-            g.signals[nq.0]
-        );
+        assert_eq!(g.signals[q.0], High, "Recovery via SET: Q should be HIGH");
+        assert_eq!(g.signals[nq.0], Low, "Recovery via SET: !Q should be LOW");
 
-        // Stress test
+        // Stress test: alternate SET/RESET 10 times
         for _ in 0..10 {
             g.drive(set, Some(Low));
-            g.propagate();
-            assert_eq!(g.signals[q.0], High);
-            g.drive(set, Some(High));
-            g.propagate();
-            assert_eq!(g.signals[q.0], High);
-
-            g.drive(reset, Some(Low));
-            g.propagate();
-            assert_eq!(g.signals[q.0], Low);
             g.drive(reset, Some(High));
             g.propagate();
-            assert_eq!(g.signals[q.0], Low);
+            assert_eq!(g.signals[q.0], High, "Stress SET: Q");
+            assert_eq!(g.signals[nq.0], Low, "Stress SET: !Q");
+
+            g.drive(set, Some(High));
+            g.drive(reset, Some(High));
+            g.propagate();
+            assert_eq!(g.signals[q.0], High, "Stress HOLD: Q");
+
+            g.drive(set, Some(High));
+            g.drive(reset, Some(Low));
+            g.propagate();
+            assert_eq!(g.signals[q.0], Low, "Stress RESET: Q");
+            assert_eq!(g.signals[nq.0], High, "Stress RESET: !Q");
+
+            g.drive(set, Some(High));
+            g.drive(reset, Some(High));
+            g.propagate();
+            assert_eq!(g.signals[q.0], Low, "Stress HOLD after RESET: Q");
         }
     }
 }

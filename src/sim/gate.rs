@@ -1,6 +1,6 @@
 #![allow(clippy::upper_case_acronyms)]
-use crate::sim::transistor::TransistorKind;
 use crate::sim::transistor::{GateDescriptor, SignalGraph, SignalId};
+use crate::sim::transistor::{SignalState, TransistorKind};
 use std::vec;
 
 struct GateId(usize);
@@ -166,23 +166,23 @@ impl Schematic {
         reset: SignalId,
     ) -> UnitDescriptor {
         use crate::sim::transistor::TransistorKind::*;
-        let q = graph.add_signal(Some("Q"));
-        let not_q = graph.add_signal(Some("!Q"));
+        let q = graph.add_sequential_signal(Some("Q"));
+        let not_q = graph.add_sequential_signal(Some("!Q"));
         let mid_top = graph.add_signal(None);
         let mid_bot = graph.add_signal(None);
 
         let first1 = graph.kinds.len();
-        let ap1 = graph.add_transistor(PMOS, set, graph.vdd(), q);
-        let ap2 = graph.add_transistor(PMOS, not_q, graph.vdd(), q);
-        let an1 = graph.add_transistor(NMOS, set, mid_top, q);
-        let an2 = graph.add_transistor(NMOS, not_q, graph.gnd(), mid_top);
+        let _ap1 = graph.add_transistor(PMOS, set, graph.vdd(), q);
+        let _ap2 = graph.add_transistor(PMOS, not_q, graph.vdd(), q);
+        let _an1 = graph.add_transistor(NMOS, set, mid_top, q);
+        let _an2 = graph.add_transistor(NMOS, not_q, graph.gnd(), mid_top);
         let last1 = graph.kinds.len();
         // nand a above, nand b under
         let first2 = graph.kinds.len();
-        let bp1 = graph.add_transistor(PMOS, reset, graph.vdd(), not_q);
-        let bp2 = graph.add_transistor(PMOS, q, graph.vdd(), not_q);
-        let bn1 = graph.add_transistor(NMOS, reset, mid_bot, not_q);
-        let bn2 = graph.add_transistor(NMOS, q, graph.gnd(), mid_bot);
+        let _bp1 = graph.add_transistor(PMOS, reset, graph.vdd(), not_q);
+        let _bp2 = graph.add_transistor(PMOS, q, graph.vdd(), not_q);
+        let _bn1 = graph.add_transistor(NMOS, reset, mid_bot, not_q);
+        let _bn2 = graph.add_transistor(NMOS, q, graph.gnd(), mid_bot);
         let last2 = graph.kinds.len();
 
         let nand1 = GateDescriptor {
