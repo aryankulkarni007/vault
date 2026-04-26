@@ -35,11 +35,11 @@ fn kahn_layout(gates: &[GateDescriptor], edges: &[(usize, usize)]) -> Vec<(usize
     }
 
     let mut queue = VecDeque::new();
-    for i in 0..n {
+    (0..n).for_each(|i| {
         if in_degree[i] == 0 {
             queue.push_back(i);
         }
-    }
+    });
 
     // if graph has cycles, topo_order length < n -> handle
     let mut topo_order = Vec::with_capacity(n);

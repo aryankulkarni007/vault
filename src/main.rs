@@ -5,44 +5,98 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
 use std::io::{self, stdout};
+use std::time::{Duration, Instant};
 mod render;
 mod sim;
 
-use crate::render::topology::{TopologyWidget, layout_gate};
+use crate::render::tlayout::{TopologyWidget, layout_gate};
 use crate::sim::transistor::{SignalGraph, SignalState};
 
+#[derive(PartialEq)]
+enum TickMode {
+    Manual,
+    Auto(u64),
+    Paused,
+}
+
 fn main() -> io::Result<()> {
-    // initialisation of the circuit
     let mut signal_graph = SignalGraph::new();
     let a = signal_graph.add_signal(Some("A"));
     let b = signal_graph.add_signal(Some("B"));
+    let clk = signal_graph.add_clock(10);
 
     let xnor = signal_graph.xnor(a, b);
     let layout = layout_gate(&signal_graph, &xnor, "XNOR");
     signal_graph.propagate();
 
-    // rendering loop
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
+    let mut tick_mode = TickMode::Paused;
+    let mut last_tick = Instant::now();
+
     loop {
+        // Auto-tick check — runs every loop iteration
+        let tick_interval: Option<u64> = match tick_mode {
+            TickMode::Auto(ms) => Some(ms),
+            _ => None,
+        };
+
+        if let Some(interval) = tick_interval
+            && last_tick.elapsed().as_millis() as u64 >= interval
+        {
+            signal_graph.tick();
+            last_tick = Instant::now();
+        }
+
         terminal.draw(|frame| {
             let area = frame.area();
+            let chunks = Layout::default()
+                .direction(ratatui::layout::Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(1)])
+                .split(area);
+
             frame.render_widget(
                 TopologyWidget {
                     graph: &signal_graph,
                     layout: &layout,
                 },
-                area,
+                chunks[0],
             );
+
+            let clk_str = if signal_graph.signals[clk.0] == SignalState::High {
+                "CLK: HIGH"
+            } else {
+                "CLK: LOW "
+            };
+            let mode_str = match tick_mode {
+                TickMode::Paused => "PAUSED ",
+                TickMode::Manual => "MANUAL ",
+                TickMode::Auto(100) => "AUTO (slow) ",
+                TickMode::Auto(500) => "AUTO (slower)",
+                TickMode::Auto(16) => "AUTO (fast) ",
+                _ => "AUTO",
+            };
+            let status = format!(
+                " {} | {} | cycle: {:>6} | [1]A [2]B [t]step [a]slow [s]slower [f]fast [space]pause [q]quit",
+                clk_str, mode_str, signal_graph.cycle_count
+            );
+            let status_style = Style::default().fg(Color::Rgb(96, 136, 96));
+            frame.render_widget(Line::from(Span::styled(status, status_style)), chunks[1]);
         })?;
-        if let Event::Key(key) = event::read()? {
+
+        if event::poll(Duration::from_millis(16))?
+            && let Event::Key(key) = event::read()?
+        {
             match key.code {
                 KeyCode::Char('q') => break,
-                KeyCode::Char('a') => {
+
+                KeyCode::Char('1') => {
                     let current = signal_graph.driven[a.0];
                     match current {
                         Some(SignalState::High) => signal_graph.drive(a, Some(SignalState::Low)),
@@ -51,7 +105,7 @@ fn main() -> io::Result<()> {
                     }
                     signal_graph.propagate();
                 }
-                KeyCode::Char('b') => {
+                KeyCode::Char('2') => {
                     let current = signal_graph.driven[b.0];
                     match current {
                         Some(SignalState::High) => signal_graph.drive(b, Some(SignalState::Low)),
@@ -60,10 +114,31 @@ fn main() -> io::Result<()> {
                     }
                     signal_graph.propagate();
                 }
+
+                KeyCode::Char('t') => {
+                    signal_graph.tick();
+                }
+                KeyCode::Char('a') => {
+                    tick_mode = TickMode::Auto(100);
+                    last_tick = Instant::now();
+                }
+                KeyCode::Char('s') => {
+                    tick_mode = TickMode::Auto(500);
+                    last_tick = Instant::now();
+                }
+                KeyCode::Char('f') => {
+                    tick_mode = TickMode::Auto(16);
+                    last_tick = Instant::now();
+                }
+                KeyCode::Char(' ') => {
+                    tick_mode = TickMode::Paused;
+                }
+
                 _ => (),
             }
         }
     }
+
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
     Ok(())
@@ -73,7 +148,7 @@ fn main() -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::sim::{
-        gate::Schematic,
+        gate::{Schematic, UnitDescriptor, UnitKind},
         transistor::{
             SignalId,
             SignalState::{self, *},
@@ -230,13 +305,13 @@ mod tests {
     }
 
     #[test]
-    fn test_mux() {
+    fn test_mux_2to1() {
         let mut g = SignalGraph::new();
         let mut s = Schematic::new();
         let a = g.add_signal(Some("A"));
         let b = g.add_signal(Some("B"));
         let sel = g.add_signal(Some("SEL"));
-        let mux = s.mux(&mut g, a, b, sel);
+        let mux = s.mux_2to1(&mut g, a, b, sel);
         let out = mux.outputs[0];
         // sel=Low → output follows a
         g.drive(sel, Some(Low));
@@ -250,5 +325,138 @@ mod tests {
             out,
             &[Low, High, Low, High],
         );
+    }
+
+    #[test]
+    fn test_mux_4to1() {
+        let mut g = SignalGraph::new();
+        let mut s = Schematic::new();
+
+        let a = g.add_signal(Some("A"));
+        let b = g.add_signal(Some("B"));
+        let c = g.add_signal(Some("C"));
+        let d = g.add_signal(Some("D"));
+        let s0 = g.add_signal(Some("S0")); // Low bit
+        let s1 = g.add_signal(Some("S1")); // High bit
+
+        let mux = s.mux_4to1(&mut g, a, b, c, d, s0, s1);
+        let out = mux.outputs[0];
+
+        // Case 00: Output follows A
+        g.drive(s1, Some(Low));
+        g.drive(s0, Some(Low));
+        g.drive(b, Some(Low));
+        g.drive(c, Some(Low));
+        g.drive(d, Some(Low));
+        check(&mut g, "MUX4_A", &[a], out, &[Low, High]);
+
+        // Case 01: Output follows B
+        g.drive(s1, Some(Low));
+        g.drive(s0, Some(High));
+        g.drive(a, Some(Low));
+        g.drive(c, Some(Low));
+        g.drive(d, Some(Low));
+        check(&mut g, "MUX4_B", &[b], out, &[Low, High]);
+
+        // Case 10: Output follows C
+        g.drive(s1, Some(High));
+        g.drive(s0, Some(Low));
+        g.drive(a, Some(Low));
+        g.drive(b, Some(Low));
+        g.drive(d, Some(Low));
+        check(&mut g, "MUX4_C", &[c], out, &[Low, High]);
+
+        // Case 11: Output follows D
+        g.drive(s1, Some(High));
+        g.drive(s0, Some(High));
+        g.drive(a, Some(Low));
+        g.drive(b, Some(Low));
+        g.drive(c, Some(Low));
+        check(&mut g, "MUX4_D", &[d], out, &[Low, High]);
+    }
+
+    #[test]
+    fn test_sr_latch() {
+        let mut g = SignalGraph::new();
+        let mut s = Schematic::new();
+        let set = g.add_signal(Some("SET"));
+        let reset = g.add_signal(Some("RESET"));
+        let latch = s.sr_latch(&mut g, set, reset);
+        let q = latch.outputs[0];
+        let nq = latch.outputs[1];
+
+        // POWER-ON RESET: pulse SET LOW to force initial state
+        g.drive(set, Some(Low));
+        g.drive(reset, Some(High));
+        g.propagate();
+        assert_eq!(g.signals[q.0], High, "After SET pulse: Q should be HIGH");
+        assert_eq!(g.signals[nq.0], Low, "After SET pulse: !Q should be LOW");
+
+        // HOLD: both HIGH → should keep Q=HIGH
+        g.drive(set, Some(High));
+        g.drive(reset, Some(High));
+        g.propagate();
+        assert_eq!(g.signals[q.0], High, "HOLD: Q should stay HIGH");
+        assert_eq!(g.signals[nq.0], Low, "HOLD: !Q should stay LOW");
+
+        // RESET: SET=HIGH, RESET=LOW → Q=LOW, !Q=HIGH
+        g.drive(set, Some(High));
+        g.drive(reset, Some(Low));
+        g.propagate();
+        assert_eq!(g.signals[q.0], Low, "RESET: Q should be LOW");
+        assert_eq!(g.signals[nq.0], High, "RESET: !Q should be HIGH");
+
+        // HOLD after RESET
+        g.drive(set, Some(High));
+        g.drive(reset, Some(High));
+        g.propagate();
+        assert_eq!(g.signals[q.0], Low, "HOLD after RESET: Q should stay LOW");
+        assert_eq!(
+            g.signals[nq.0], High,
+            "HOLD after RESET: !Q should stay HIGH"
+        );
+
+        // SET again
+        g.drive(set, Some(Low));
+        g.drive(reset, Some(High));
+        g.propagate();
+        assert_eq!(g.signals[q.0], High, "SET again: Q should be HIGH");
+        assert_eq!(g.signals[nq.0], Low, "SET again: !Q should be LOW");
+
+        // FORBIDDEN: both LOW → both outputs HIGH
+        g.drive(set, Some(Low));
+        g.drive(reset, Some(Low));
+        g.propagate();
+        assert_eq!(g.signals[q.0], High, "Forbidden: Q should be HIGH");
+        assert_eq!(g.signals[nq.0], High, "Forbidden: !Q should be HIGH");
+
+        // RECOVERY: release both to HIGH → settles to valid state
+        g.drive(set, Some(High));
+        g.drive(reset, Some(High));
+        g.propagate();
+        assert!(
+            (g.signals[q.0] == High && g.signals[nq.0] == Low)
+                || (g.signals[q.0] == Low && g.signals[nq.0] == High),
+            "Recovery: Q and !Q must be complements, got Q={:?} !Q={:?}",
+            g.signals[q.0],
+            g.signals[nq.0]
+        );
+
+        // Stress test
+        for _ in 0..10 {
+            g.drive(set, Some(Low));
+            g.propagate();
+            assert_eq!(g.signals[q.0], High);
+            g.drive(set, Some(High));
+            g.propagate();
+            assert_eq!(g.signals[q.0], High);
+
+            g.drive(reset, Some(Low));
+            g.propagate();
+            assert_eq!(g.signals[q.0], Low);
+            g.drive(reset, Some(High));
+            g.propagate();
+            assert_eq!(g.signals[q.0], Low);
+        }
     }
 }

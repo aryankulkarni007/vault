@@ -24,6 +24,45 @@ pub enum TransistorKind {
     PMOS,
 }
 
+#[derive(Clone)]
+pub struct CapacitorState {
+    pub charge: u8,     // current charge level (0 to period)
+    pub threshold: u8,  // crossing point where output flips
+    pub period: u8,     // total ticks for a full charge/discharge half-cycle
+    pub charging: bool, // true = charging up, false = discharging down
+}
+
+impl SignalGraph {
+    pub fn tick(&mut self) {
+        for (sid, cap_opt) in self.capacitors.iter_mut().enumerate() {
+            if let Some(cap) = cap_opt {
+                if cap.charging {
+                    cap.charge += 1;
+                    if cap.charge >= cap.period {
+                        cap.charging = false;
+                    }
+                } else {
+                    if cap.charge > 0 {
+                        cap.charge -= 1;
+                    }
+                    if cap.charge == 0 {
+                        cap.charging = true;
+                    }
+                }
+                let state = if cap.charge >= cap.threshold {
+                    SignalState::High
+                } else {
+                    SignalState::Low
+                };
+                self.signals[sid] = state;
+                self.driven[sid] = Some(state);
+            }
+        }
+        self.cycle_count += 1;
+        self.propagate();
+    }
+}
+
 pub struct SignalGraph {
     // signal data
     pub signals: Vec<SignalState>,
@@ -36,6 +75,8 @@ pub struct SignalGraph {
     pub drains: Vec<SignalId>,
     pub eval_order: Vec<TransistorId>, // for kahn's algorithm,
     pub dirty: bool,                   // for lazy re-eval
+    pub capacitors: Vec<Option<CapacitorState>>,
+    pub cycle_count: u64, // increment in tick()
 }
 
 /// for visualisation
@@ -66,20 +107,23 @@ impl SignalGraph {
             drains: Vec::new(),
             eval_order: Vec::new(),
             dirty: false,
+            capacitors: vec![None, None],
+            cycle_count: 0,
         }
     }
 
     /// adds floating signal -> signal id
     pub fn add_signal(&mut self, name: Option<&str>) -> SignalId {
-        let id = self.signals.len();
+        let id = SignalId(self.signals.len());
         self.signals.push(SignalState::Floating);
         self.driven.push(None);
         self.signal_names.push(name.map(|s| s.to_string()));
-        SignalId(id)
+        self.capacitors.push(None);
+        id
     }
 
     /// connects the gate, source and the drain and pushes transistor
-    fn add_transistor(
+    pub fn add_transistor(
         &mut self,
         kind: TransistorKind,
         gate: SignalId,
@@ -93,6 +137,20 @@ impl SignalGraph {
         self.drains.push(drain);
         self.dirty = true;
         TransistorId(id)
+    }
+
+    pub fn add_clock(&mut self, period: u8) -> SignalId {
+        let id = self.add_signal(Some("CLK"));
+        let threshold = period / 2;
+        self.capacitors[id.0] = Some(CapacitorState {
+            charge: 0,
+            threshold,
+            period,
+            charging: true,
+        });
+        self.signals[id.0] = SignalState::Low;
+        self.driven[id.0] = Some(SignalState::Low);
+        id
     }
 
     pub fn drive(&mut self, id: SignalId, state: Option<SignalState>) {
@@ -167,13 +225,13 @@ impl SignalGraph {
         }
     }
 
+    /// evaluate the transistors; rebuilds the graph if changed
     pub fn propagate(&mut self) {
-        // step 1: recompute eval_order if dirty
         if self.dirty {
             self.kahn();
         }
 
-        // step 2: reset all non-externally-driven signals to Floating
+        // Reset all non-driven signals to Floating
         for i in 0..self.signals.len() {
             if let Some(state) = self.driven[i] {
                 self.signals[i] = state;
@@ -182,31 +240,20 @@ impl SignalGraph {
             }
         }
 
-        // safety
         let mut iterations = 0;
-        let max_iterations = self.kinds.len() + 1;
+        let max_iterations = self.kinds.len() * 100; // debug
 
-        // step 3: evaluate transistors in eval_order
-        // for each transistor;
-        // -    check gate state
-        // -    determine conductivity based on kind
-        // -    if conducting, resolve source and drain states
         loop {
-            // NOTE: loop is for iterative relaxation
-            // deals with the issue of cyclic dependency
             let prev = self.signals.clone();
-            for i in 0..self.eval_order.len() {
-                let transistor_idx = self.eval_order[i].0;
+            for transistor_idx in 0..self.kinds.len() {
                 let kind = self.kinds[transistor_idx];
                 let gate = self.gates[transistor_idx].0;
                 let source = self.sources[transistor_idx].0;
                 let drain = self.drains[transistor_idx].0;
 
-                let gate_state = self.signals[gate];
-
                 let conducting = match kind {
-                    TransistorKind::NMOS => gate_state == SignalState::High,
-                    TransistorKind::PMOS => gate_state == SignalState::Low,
+                    TransistorKind::NMOS => self.signals[gate] == SignalState::High,
+                    TransistorKind::PMOS => self.signals[gate] == SignalState::Low,
                 };
 
                 if conducting {
@@ -215,13 +262,13 @@ impl SignalGraph {
                     self.signals[drain] = resolved;
                 }
             }
+            iterations += 1;
             if self.signals == prev || iterations >= max_iterations {
                 break;
             }
-            iterations += 1;
         }
 
-        // step 4: apply external drives
+        // Re-apply external drives
         for i in 0..self.signals.len() {
             if let Some(state) = self.driven[i] {
                 self.signals[i] = state;
@@ -229,10 +276,10 @@ impl SignalGraph {
         }
     }
 
-    fn vdd(&self) -> SignalId {
+    pub fn vdd(&self) -> SignalId {
         SignalId(0)
     }
-    fn gnd(&self) -> SignalId {
+    pub fn gnd(&self) -> SignalId {
         SignalId(1)
     }
 }

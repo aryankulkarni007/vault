@@ -15,7 +15,7 @@ LAYER 1: Gate — CURRENT
   - (X) half adder
   - (X) full adder
   - (X) 4-bit ripple carry adder
-  - ( ) MUX 2:1, MUX 4:1
+  - (X) MUX 2:1, MUX 4:1
   - ( ) decoder, encoder
 - ( ) Sequential units (needs clock first):
   - ( ) SR latch
