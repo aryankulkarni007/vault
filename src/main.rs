@@ -1,195 +1,212 @@
-use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode};
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use std::io;
+use std::time::{Duration, Instant};
+
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use std::io::{self, stdout};
-use std::time::{Duration, Instant};
+mod gallery;
 mod render;
 mod sim;
 
-use crate::render::tlayout::{TopologyWidget, layout_gate};
-use crate::sim::transistor::{SignalGraph, SignalState};
+use crate::render::panel::SignalPanel;
+use crate::render::tlayout::TopologyWidget;
+use crate::sim::transistor::SignalState;
 
 #[derive(PartialEq)]
 enum TickMode {
-    Manual,
     Auto(u64),
     Paused,
 }
 
+const PAN_STEP: u16 = 8;
+
 fn main() -> io::Result<()> {
-    let mut signal_graph = SignalGraph::new();
-    let a = signal_graph.add_signal(Some("A"));
-    let b = signal_graph.add_signal(Some("B"));
-    let clk = signal_graph.add_clock(10);
+    let mut scenes = gallery::scenes();
+    let total = scenes.len();
+    let mut current = 0;
+    let mut scroll_x: u16 = 0;
 
-    let xnor = signal_graph.xnor(a, b);
-    let layout = layout_gate(&signal_graph, &xnor, "XNOR");
-    signal_graph.propagate();
-
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    // init() also installs a panic hook that restores the terminal, so a
+    // crash never leaves the shell stuck in raw mode
+    let mut terminal = ratatui::init();
 
     let mut tick_mode = TickMode::Paused;
     let mut last_tick = Instant::now();
 
-    loop {
-        // Auto-tick check — runs every loop iteration
-        let tick_interval: Option<u64> = match tick_mode {
-            TickMode::Auto(ms) => Some(ms),
-            _ => None,
-        };
+    let result = loop {
+        let scene = &mut scenes[current];
 
-        if let Some(interval) = tick_interval
+        // Auto-tick check, runs every loop iteration
+        if let TickMode::Auto(interval) = tick_mode
             && last_tick.elapsed().as_millis() as u64 >= interval
         {
-            signal_graph.tick();
+            scene.graph.tick();
             last_tick = Instant::now();
         }
 
-        terminal.draw(|frame| {
-            let area = frame.area();
-            let chunks = Layout::default()
+        let drawn = terminal.draw(|frame| {
+            let rows = Layout::default()
                 .direction(ratatui::layout::Direction::Vertical)
                 .constraints([Constraint::Min(3), Constraint::Length(1)])
-                .split(area);
+                .split(frame.area());
+            let cols = Layout::default()
+                .direction(ratatui::layout::Direction::Horizontal)
+                .constraints([Constraint::Min(20), Constraint::Length(22)])
+                .split(rows[0]);
 
             frame.render_widget(
                 TopologyWidget {
-                    graph: &signal_graph,
-                    layout: &layout,
+                    graph: &scene.graph,
+                    layout: &scene.layout,
+                    scroll_x,
                 },
-                chunks[0],
+                cols[0],
+            );
+            frame.render_widget(
+                SignalPanel {
+                    graph: &scene.graph,
+                    inputs: &scene.inputs,
+                },
+                cols[1],
             );
 
-            let clk_str = if signal_graph.signals[clk.0] == SignalState::High {
+            let clk_str = if scene.graph.signals[scene.clock.0] == SignalState::High {
                 "CLK: HIGH"
             } else {
                 "CLK: LOW "
             };
             let mode_str = match tick_mode {
-                TickMode::Paused => "PAUSED ",
-                TickMode::Manual => "MANUAL ",
-                TickMode::Auto(100) => "AUTO (slow) ",
-                TickMode::Auto(500) => "AUTO (slower)",
-                TickMode::Auto(16) => "AUTO (fast) ",
-                _ => "AUTO",
+                TickMode::Paused => "PAUSED".to_string(),
+                TickMode::Auto(ms) => format!("AUTO {}ms", ms),
+            };
+            let settle_str = if scene.graph.settled {
+                "SETTLED"
+            } else {
+                "UNSTABLE"
             };
             let status = format!(
-                " {} | {} | cycle: {:>6} | [1]A [2]B [t]step [a]slow [s]slower [f]fast [space]pause [q]quit",
-                clk_str, mode_str, signal_graph.cycle_count
+                " {}/{} | {} stages, {} transistors | {} | {} | {} | cycle: {:>6} | [1-9]inputs [tab]circuit [←→]pan [t]step [a]slow [s]slower [f]fast [space]pause [q]quit",
+                current + 1,
+                total,
+                scene.layout.stages.len(),
+                scene.layout.devices().len(),
+                clk_str,
+                mode_str,
+                settle_str,
+                scene.graph.cycle_count
             );
             let status_style = Style::default().fg(Color::Rgb(96, 136, 96));
-            frame.render_widget(Line::from(Span::styled(status, status_style)), chunks[1]);
-        })?;
-
-        if event::poll(Duration::from_millis(16))?
-            && let Event::Key(key) = event::read()?
-        {
-            match key.code {
-                KeyCode::Char('q') => break,
-
-                KeyCode::Char('1') => {
-                    let current = signal_graph.driven[a.0];
-                    match current {
-                        Some(SignalState::High) => signal_graph.drive(a, Some(SignalState::Low)),
-                        Some(SignalState::Low) => signal_graph.drive(a, Some(SignalState::High)),
-                        _ => signal_graph.drive(a, Some(SignalState::Low)),
-                    }
-                    signal_graph.propagate();
-                }
-                KeyCode::Char('2') => {
-                    let current = signal_graph.driven[b.0];
-                    match current {
-                        Some(SignalState::High) => signal_graph.drive(b, Some(SignalState::Low)),
-                        Some(SignalState::Low) => signal_graph.drive(b, Some(SignalState::High)),
-                        _ => signal_graph.drive(b, Some(SignalState::Low)),
-                    }
-                    signal_graph.propagate();
-                }
-
-                KeyCode::Char('t') => {
-                    signal_graph.tick();
-                }
-                KeyCode::Char('a') => {
-                    tick_mode = TickMode::Auto(100);
-                    last_tick = Instant::now();
-                }
-                KeyCode::Char('s') => {
-                    tick_mode = TickMode::Auto(500);
-                    last_tick = Instant::now();
-                }
-                KeyCode::Char('f') => {
-                    tick_mode = TickMode::Auto(16);
-                    last_tick = Instant::now();
-                }
-                KeyCode::Char(' ') => {
-                    tick_mode = TickMode::Paused;
-                }
-
-                _ => (),
-            }
+            frame.render_widget(Line::from(Span::styled(status, status_style)), rows[1]);
+        });
+        if let Err(e) = drawn {
+            break Err(e);
         }
-    }
 
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-    Ok(())
+        match event::poll(Duration::from_millis(16)) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(e) => break Err(e),
+        }
+        let key = match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => key,
+            Ok(_) => continue,
+            Err(e) => break Err(e),
+        };
+        let scene = &mut scenes[current];
+        match key.code {
+            KeyCode::Char('q') => break Ok(()),
+
+            KeyCode::Char(c @ '1'..='9') => {
+                let index = c as usize - '1' as usize;
+                if let Some(&input) = scene.inputs.get(index) {
+                    let next = match scene.graph.driven[input.0] {
+                        Some(SignalState::Low) => SignalState::High,
+                        _ => SignalState::Low,
+                    };
+                    scene.graph.drive(input, Some(next));
+                    scene.graph.propagate();
+                }
+            }
+
+            KeyCode::Tab => {
+                current = (current + 1) % scenes.len();
+                scroll_x = 0;
+            }
+            KeyCode::BackTab => {
+                current = (current + scenes.len() - 1) % scenes.len();
+                scroll_x = 0;
+            }
+            KeyCode::Left | KeyCode::Char('h') => scroll_x = scroll_x.saturating_sub(PAN_STEP),
+            KeyCode::Right | KeyCode::Char('l') => {
+                scroll_x = (scroll_x + PAN_STEP).min(scene.layout.width());
+            }
+
+            KeyCode::Char('t') => {
+                scene.graph.tick();
+            }
+            KeyCode::Char('a') => {
+                tick_mode = TickMode::Auto(100);
+                last_tick = Instant::now();
+            }
+            KeyCode::Char('s') => {
+                tick_mode = TickMode::Auto(500);
+                last_tick = Instant::now();
+            }
+            KeyCode::Char('f') => {
+                tick_mode = TickMode::Auto(16);
+                last_tick = Instant::now();
+            }
+            KeyCode::Char(' ') => {
+                tick_mode = TickMode::Paused;
+            }
+
+            _ => (),
+        }
+    };
+
+    ratatui::restore();
+    result
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::sim::{
-        gate::Schematic,
-        transistor::{
-            SignalId,
-            SignalState::{self, *},
-        },
-    };
+    use crate::sim::gate::Schematic;
+    use crate::sim::transistor::SignalGraph;
+    use crate::sim::transistor::SignalId;
+    use crate::sim::transistor::SignalState::{self, *};
 
-    fn check(
-        g: &mut SignalGraph,
-        name: &str,
-        ins: &[SignalId],
-        out: SignalId,
-        exp: &[SignalState],
-    ) {
+    fn check(g: &mut SignalGraph,
+             name: &str,
+             ins: &[SignalId],
+             out: SignalId,
+             exp: &[SignalState]) {
         println!("\nTruth Table: {}", name);
         let header = ins.iter().map(|_| "In").collect::<Vec<_>>().join(" | ");
         println!(" {} | OUT\n{}", header, "-".repeat(header.len() + 7));
 
         (0..(1 << ins.len())).for_each(|i| {
-            let mut row = Vec::new();
-            for j in 0..ins.len() {
-                let state = if (i >> (ins.len() - 1 - j)) & 1 == 1 {
-                    High
-                } else {
-                    Low
-                };
-                g.drive(ins[j], Some(state));
-                row.push(if state == High { "1" } else { "0" });
-            }
-            g.propagate();
-            let act = g.signals[out.0];
-            println!(
-                " {} |  {}",
-                row.join(" | "),
-                if act == High { "1" } else { "0" }
-            );
-            assert_eq!(act, exp[i], "Fail {} at case {}", name, i);
-            // Cleanup: undrive inputs so they don't affect next row
-            for &input in ins {
-                g.drive(input, None);
-            }
-        });
+                                 let mut row = Vec::new();
+                                 for j in 0..ins.len() {
+                                     let state = if (i >> (ins.len() - 1 - j)) & 1 == 1 {
+                                         High
+                                     } else {
+                                         Low
+                                     };
+                                     g.drive(ins[j], Some(state));
+                                     row.push(if state == High { "1" } else { "0" });
+                                 }
+                                 g.propagate();
+                                 let act = g.signals[out.0];
+                                 println!(" {} |  {}",
+                                          row.join(" | "),
+                                          if act == High { "1" } else { "0" });
+                                 assert_eq!(act, exp[i], "Fail {} at case {}", name, i);
+                                 // Cleanup: undrive inputs so they don't affect next row
+                                 for &input in ins {
+                                     g.drive(input, None);
+                                 }
+                             });
     }
 
     #[test]
@@ -203,6 +220,8 @@ mod tests {
         let nor_out = g.nor(a, b).output;
         let xor_out = g.xor(a, b).output;
         let xnor_out = g.xnor(a, b).output;
+        let or_out = g.or(a, b, true).output;
+        let or_nand_out = g.or(a, b, false).output;
 
         check(&mut g, "NOT", &[a], not_out, &[High, Low]);
         check(&mut g, "NAND", &[a, b], nand_out, &[High, High, High, Low]);
@@ -210,6 +229,32 @@ mod tests {
         check(&mut g, "NOR", &[a, b], nor_out, &[High, Low, Low, Low]);
         check(&mut g, "XOR", &[a, b], xor_out, &[Low, High, High, Low]);
         check(&mut g, "XNOR", &[a, b], xnor_out, &[High, Low, Low, High]);
+        check(&mut g, "OR", &[a, b], or_out, &[Low, High, High, High]);
+        check(&mut g, "OR_NAND", &[a, b], or_nand_out, &[Low, High, High, High]);
+    }
+
+    #[test]
+    fn test_sr_latch_metastable_release() {
+        let mut g = SignalGraph::new();
+        let mut s = Schematic::new();
+        let set = g.add_signal(Some("SET"));
+        let reset = g.add_signal(Some("RESET"));
+        let latch = s.sr_latch(&mut g, set, reset);
+        let q = latch.outputs[0];
+
+        // forbidden state settles: both outputs forced HIGH
+        g.drive(set, Some(Low));
+        g.drive(reset, Some(Low));
+        g.propagate();
+        assert!(g.settled, "forbidden state is still a fixed point");
+        assert_eq!(g.signals[q.0], High);
+
+        // releasing both at once is the textbook race: the perfectly symmetric
+        // latch oscillates, and propagate() reports it instead of looping forever
+        g.drive(set, Some(High));
+        g.drive(reset, Some(High));
+        g.propagate();
+        assert!(!g.settled, "symmetric release should not settle");
     }
 
     #[test]
@@ -234,38 +279,30 @@ mod tests {
         let fa = s.full_adder(&mut g, a, b, cin);
         let sum = fa.outputs[0];
         let cout = fa.outputs[1];
-        check(
-            &mut g,
-            "FA_SUM",
-            &[a, b, cin],
-            sum,
-            &[Low, High, High, Low, High, Low, Low, High],
-        );
-        check(
-            &mut g,
-            "FA_COUT",
-            &[a, b, cin],
-            cout,
-            &[Low, Low, Low, High, Low, High, High, High],
-        );
+        check(&mut g,
+              "FA_SUM",
+              &[a, b, cin],
+              sum,
+              &[Low, High, High, Low, High, Low, Low, High]);
+        check(&mut g,
+              "FA_COUT",
+              &[a, b, cin],
+              cout,
+              &[Low, Low, Low, High, Low, High, High, High]);
     }
 
     #[test]
     fn test_adder_4bit() {
         let mut g = SignalGraph::new();
         let mut s = Schematic::new();
-        let a = [
-            g.add_signal(Some("A0")),
-            g.add_signal(Some("A1")),
-            g.add_signal(Some("A2")),
-            g.add_signal(Some("A3")),
-        ];
-        let b = [
-            g.add_signal(Some("B0")),
-            g.add_signal(Some("B1")),
-            g.add_signal(Some("B2")),
-            g.add_signal(Some("B3")),
-        ];
+        let a = [g.add_signal(Some("A0")),
+                 g.add_signal(Some("A1")),
+                 g.add_signal(Some("A2")),
+                 g.add_signal(Some("A3"))];
+        let b = [g.add_signal(Some("B0")),
+                 g.add_signal(Some("B1")),
+                 g.add_signal(Some("B2")),
+                 g.add_signal(Some("B3"))];
         let cin = g.add_signal(Some("CIN"));
         let adder = s.adder_4bit(&mut g, a, b, cin);
 
@@ -322,13 +359,11 @@ mod tests {
         check(&mut g, "MUX_SEL_LOW", &[a, b], out, &[Low, Low, High, High]);
         // sel=High → output follows b
         g.drive(sel, Some(High));
-        check(
-            &mut g,
-            "MUX_SEL_HIGH",
-            &[a, b],
-            out,
-            &[Low, High, Low, High],
-        );
+        check(&mut g,
+              "MUX_SEL_HIGH",
+              &[a, b],
+              out,
+              &[Low, High, Low, High]);
     }
 
     #[test]
@@ -415,10 +450,8 @@ mod tests {
         g.drive(reset, Some(High));
         g.propagate();
         assert_eq!(g.signals[q.0], Low, "HOLD after RESET: Q should stay LOW");
-        assert_eq!(
-            g.signals[nq.0], High,
-            "HOLD after RESET: !Q should stay HIGH"
-        );
+        assert_eq!(g.signals[nq.0], High,
+                   "HOLD after RESET: !Q should stay HIGH");
 
         // SET again
         g.drive(set, Some(Low));

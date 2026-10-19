@@ -1,7 +1,5 @@
+#![allow(clippy::upper_case_acronyms)]
 use crate::sim::gate::GateKind;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::collections::VecDeque;
 
 /// index for signals
 #[derive(Clone, Copy, PartialEq, Debug, Eq, Hash)]
@@ -11,8 +9,8 @@ pub struct SignalId(pub usize);
 pub enum SignalState {
     High,
     Low,
-    Floating,
-    Conflict,
+    Floating, // no path to a driver and no stored charge
+    Conflict, // a net connected to drivers that disagree (short circuit)
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -37,44 +35,46 @@ pub struct SignalGraph {
     pub signals: Vec<SignalState>,
     pub driven: Vec<Option<SignalState>>,
     pub signal_names: Vec<Option<String>>,
-    pub sequential: Vec<SignalId>, // signals that persist state across propagations
     // transistor data
     pub kinds: Vec<TransistorKind>,
     pub gates: Vec<SignalId>,
     pub sources: Vec<SignalId>,
     pub drains: Vec<SignalId>,
-    pub eval_order: Vec<TransistorId>,
-    pub dirty: bool,
     pub capacitors: Vec<Option<CapacitorState>>,
     pub cycle_count: u64,
+    /// false when the last propagate() hit its iteration cap without reaching a
+    /// fixed point (an oscillating or metastable circuit)
+    pub settled: bool,
+}
+
+/// How a gate is physically built.
+pub enum GateBody {
+    /// one CMOS stage: a PMOS pull-up and an NMOS pull-down sharing one output
+    Stage(Vec<usize>),
+    /// built out of other gates
+    Composite(Vec<GateDescriptor>),
 }
 
 pub struct GateDescriptor {
     pub kind: GateKind,
-    pub inputs: Vec<SignalId>,
     pub output: SignalId,
-    pub transistors: Option<Vec<usize>>,
-    pub sub_gates: Option<Vec<GateDescriptor>>,
+    pub body: GateBody,
 }
 
 impl SignalGraph {
     pub fn new() -> Self {
         let vdd = SignalState::High;
         let gnd = SignalState::Low;
-        SignalGraph {
-            signals: vec![vdd, gnd],
-            driven: vec![Some(vdd), Some(gnd)],
-            signal_names: vec![Some("VDD".to_string()), Some("GND".to_string())],
-            sequential: Vec::new(),
-            kinds: Vec::new(),
-            gates: Vec::new(),
-            sources: Vec::new(),
-            drains: Vec::new(),
-            eval_order: Vec::new(),
-            dirty: false,
-            capacitors: vec![None, None],
-            cycle_count: 0,
-        }
+        SignalGraph { signals: vec![vdd, gnd],
+                      driven: vec![Some(vdd), Some(gnd)],
+                      signal_names: vec![Some("VDD".to_string()), Some("GND".to_string())],
+                      kinds: Vec::new(),
+                      gates: Vec::new(),
+                      sources: Vec::new(),
+                      drains: Vec::new(),
+                      capacitors: vec![None, None],
+                      cycle_count: 0,
+                      settled: true }
     }
 
     pub fn add_signal(&mut self, name: Option<&str>) -> SignalId {
@@ -86,38 +86,32 @@ impl SignalGraph {
         id
     }
 
-    /// signal that persists state across propagations (Q, !Q, register outputs)
-    pub fn add_sequential_signal(&mut self, name: Option<&str>) -> SignalId {
-        let id = self.add_signal(name);
-        self.sequential.push(id);
-        id
+    /// names (or renames) a signal, e.g. to label a circuit's outputs
+    pub fn name(&mut self, id: SignalId, name: &str) {
+        self.signal_names[id.0] = Some(name.to_string());
     }
 
-    pub fn add_transistor(
-        &mut self,
-        kind: TransistorKind,
-        gate: SignalId,
-        source: SignalId,
-        drain: SignalId,
-    ) -> TransistorId {
+    pub fn add_transistor(&mut self,
+                          kind: TransistorKind,
+                          gate: SignalId,
+                          source: SignalId,
+                          drain: SignalId)
+                          -> TransistorId {
         let id = self.kinds.len();
         self.kinds.push(kind);
         self.gates.push(gate);
         self.sources.push(source);
         self.drains.push(drain);
-        self.dirty = true;
         TransistorId(id)
     }
 
     pub fn add_clock(&mut self, period: u8) -> SignalId {
         let id = self.add_signal(Some("CLK"));
         let threshold = period / 2;
-        self.capacitors[id.0] = Some(CapacitorState {
-            charge: 0,
-            threshold,
-            period,
-            charging: true,
-        });
+        self.capacitors[id.0] = Some(CapacitorState { charge: 0,
+                                                      threshold,
+                                                      period,
+                                                      charging: true });
         self.signals[id.0] = SignalState::Low;
         self.driven[id.0] = Some(SignalState::Low);
         id
@@ -134,156 +128,102 @@ impl SignalGraph {
         SignalId(1)
     }
 
-    fn kahn(&mut self) {
-        let signal_to_transistors = self.gates.iter().enumerate().fold(
-            HashMap::new(),
-            |mut map: HashMap<usize, Vec<usize>>, (t_idx, sig_id)| {
-                map.entry(sig_id.0).or_default().push(t_idx);
-                map
-            },
-        );
+    /// a transistor is a switch: NMOS closes on a HIGH gate, PMOS on a LOW gate.
+    /// a floating or conflicted gate leaves the switch open.
+    pub fn conducting(&self, t: usize) -> bool {
+        let gate = self.signals[self.gates[t].0];
+        match self.kinds[t] {
+            TransistorKind::NMOS => gate == SignalState::High,
+            TransistorKind::PMOS => gate == SignalState::Low,
+        }
+    }
 
-        let n = self.kinds.len();
-        let (dependents, mut in_degree) = self.drains.iter().enumerate().fold(
-            (vec![vec![]; n], vec![0usize; n]),
-            |mut acc, (i, drain_signal)| {
-                acc.0[i] = signal_to_transistors
-                    .get(&drain_signal.0)
-                    .cloned()
-                    .unwrap_or_default();
-                acc.0[i].iter().for_each(|j| acc.1[*j] += 1);
-                acc
-            },
-        );
+    /// combines two drivers on the same net
+    fn resolve(a: SignalState, b: SignalState) -> SignalState {
+        use SignalState::*;
+        match (a, b) {
+            (Floating, x) | (x, Floating) => x,
+            (High, High) => High,
+            (Low, Low) => Low,
+            _ => Conflict,
+        }
+    }
 
-        self.eval_order.clear();
-        let mut queue: VecDeque<usize> = in_degree
-            .iter()
-            .enumerate()
-            .filter(|&(_idx, &degree)| degree == 0)
-            .map(|(i, _)| i)
-            .collect();
+    /// one relaxation step. every conducting transistor joins its source and
+    /// drain into one net (union-find), then every net takes a single value:
+    ///
+    ///   net touches drivers (VDD, GND, inputs)  -> their resolved value
+    ///   net touches no driver                   -> keeps its stored charge
+    ///
+    /// Charge retention is what lets a cross-coupled latch hold its state.
+    fn resolve_nets(&self) -> Vec<SignalState> {
+        let n = self.signals.len();
+        let mut parent: Vec<usize> = (0..n).collect();
 
-        while let Some(i) = queue.pop_front() {
-            self.eval_order.push(TransistorId(i));
-            for &j in &dependents[i] {
-                in_degree[j] -= 1;
-                if in_degree[j] == 0 {
-                    queue.push_back(j);
-                }
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]]; // path halving
+                x = parent[x];
+            }
+            x
+        }
+
+        for t in 0..self.kinds.len() {
+            if self.conducting(t) {
+                let a = find(&mut parent, self.sources[t].0);
+                let b = find(&mut parent, self.drains[t].0);
+                parent[a] = b;
             }
         }
 
-        if self.eval_order.len() < self.kinds.len() {
-            // cycles exist — sequential circuit
+        // per net root: the value forced by drivers, and the charge left on it
+        let mut forced: Vec<Option<SignalState>> = vec![None; n];
+        let mut charge: Vec<Option<SignalState>> = vec![None; n];
+        for i in 0..n {
+            let root = find(&mut parent, i);
+            if let Some(state) = self.driven[i] {
+                forced[root] = Some(Self::resolve(forced[root].unwrap_or(state), state));
+            } else if matches!(self.signals[i], SignalState::High | SignalState::Low) {
+                // charge sharing between nodes that disagree loses the value
+                charge[root] =
+                    Some(match charge[root] {
+                             Some(prev) if prev != self.signals[i] => SignalState::Floating,
+                             _ => self.signals[i],
+                         });
+            }
         }
-        self.dirty = false;
+
+        (0..n).map(|i| {
+                  if let Some(state) = self.driven[i] {
+                      return state; // drives always win on the driven node itself
+                  }
+                  let root = find(&mut parent, i);
+                  forced[root].or(charge[root])
+                              .unwrap_or(SignalState::Floating)
+              })
+              .collect()
     }
 
-    fn resolve(a: SignalState, b: SignalState) -> SignalState {
-        match (a, b) {
-            (SignalState::High, SignalState::High) => SignalState::High,
-            (SignalState::Low, SignalState::Low) => SignalState::Low,
-            (SignalState::High, SignalState::Floating) => SignalState::High,
-            (SignalState::Low, SignalState::Floating) => SignalState::Low,
-            (SignalState::Floating, SignalState::High) => SignalState::High,
-            (SignalState::Floating, SignalState::Low) => SignalState::Low,
-            (SignalState::Floating, SignalState::Floating) => SignalState::Floating,
-            (SignalState::High, SignalState::Low) => SignalState::Conflict,
-            (SignalState::Low, SignalState::High) => SignalState::Conflict,
-            (_, SignalState::Conflict) => SignalState::Conflict,
-            (SignalState::Conflict, _) => SignalState::Conflict,
-        }
-    }
-
+    /// relaxes the circuit to a fixed point. each step lets a change ripple
+    /// through one more CMOS stage, so a combinational circuit settles in at
+    /// most (depth + 1) steps; a circuit that is still changing at the cap is
+    /// oscillating and is reported through `settled`.
     pub fn propagate(&mut self) {
-        if self.dirty {
-            self.kahn();
-        }
-
-        let eval_set: HashSet<usize> = self.eval_order.iter().map(|t| t.0).collect();
-        let has_cycles = eval_set.len() < self.kinds.len();
-
-        // build sequential set for O(1) lookup
-        let sequential_set: HashSet<usize> = self.sequential.iter().map(|s| s.0).collect();
-
-        // reset phase: sequential signals preserve state, everything else floats
         for i in 0..self.signals.len() {
             if let Some(state) = self.driven[i] {
                 self.signals[i] = state;
-            } else if !sequential_set.contains(&i) {
-                self.signals[i] = SignalState::Floating;
-            }
-            // sequential non-driven signals keep current value
-        }
-
-        // build full eval order: topo-sorted first, cyclic remainder after — O(n)
-        let mut in_order = Vec::with_capacity(self.kinds.len());
-        let mut remainder = Vec::new();
-        for i in 0..self.kinds.len() {
-            if eval_set.contains(&i) {
-                in_order.push(i);
-            } else {
-                remainder.push(i);
             }
         }
-        // eval_order is already topo-sorted, use it directly
-        let full_order: Vec<usize> = self
-            .eval_order
-            .iter()
-            .map(|&TransistorId(i)| i)
-            .chain(remainder)
-            .collect();
 
-        let max_iterations = if has_cycles {
-            self.kinds.len() * 4
-        } else {
-            self.kinds.len() + 1
-        };
-
-        let mut iterations = 0;
-        loop {
-            let prev = self.signals.clone();
-            for &t_idx in &full_order {
-                let kind = self.kinds[t_idx];
-                let gate = self.gates[t_idx].0;
-                let source = self.sources[t_idx].0;
-                let drain = self.drains[t_idx].0;
-
-                let conducting = match kind {
-                    TransistorKind::NMOS => self.signals[gate] == SignalState::High,
-                    TransistorKind::PMOS => self.signals[gate] == SignalState::Low,
-                };
-
-                if conducting {
-                    let src_driven = self.driven[source].is_some();
-                    let drn_driven = self.driven[drain].is_some();
-                    if src_driven && !drn_driven {
-                        self.signals[drain] = self.signals[source];
-                    } else if drn_driven && !src_driven {
-                        self.signals[source] = self.signals[drain];
-                    } else {
-                        let resolved = Self::resolve(self.signals[source], self.signals[drain]);
-                        if !src_driven {
-                            self.signals[source] = resolved;
-                        }
-                        if !drn_driven {
-                            self.signals[drain] = resolved;
-                        }
-                    }
-                }
-            }
-            iterations += 1;
-            if self.signals == prev || iterations >= max_iterations {
+        let max_iterations = self.kinds.len() + 2;
+        self.settled = false;
+        for _ in 0..max_iterations {
+            let next = self.resolve_nets();
+            if next == self.signals {
+                self.settled = true;
                 break;
             }
-        }
-
-        // re-apply drives — always win
-        for i in 0..self.signals.len() {
-            if let Some(state) = self.driven[i] {
-                self.signals[i] = state;
-            }
+            self.signals = next;
         }
     }
 
@@ -318,91 +258,64 @@ impl SignalGraph {
 }
 
 impl SignalGraph {
+    fn stage(&self, kind: GateKind, output: SignalId, first: usize) -> GateDescriptor {
+        GateDescriptor { kind,
+                         output,
+                         body: GateBody::Stage((first..self.kinds.len()).collect()) }
+    }
+
     pub fn nand(&mut self, a: SignalId, b: SignalId) -> GateDescriptor {
-        let out = self.add_signal(Some("OUT"));
+        let out = self.add_signal(None);
         let mid = self.add_signal(None);
         let first = self.kinds.len();
         self.add_transistor(TransistorKind::PMOS, a, self.vdd(), out);
         self.add_transistor(TransistorKind::PMOS, b, self.vdd(), out);
         self.add_transistor(TransistorKind::NMOS, a, mid, out);
         self.add_transistor(TransistorKind::NMOS, b, self.gnd(), mid);
-        let last = self.kinds.len();
-        GateDescriptor {
-            kind: GateKind::NAND,
-            inputs: vec![a, b],
-            output: out,
-            transistors: Some((first..last).collect()),
-            sub_gates: None,
-        }
+        self.stage(GateKind::NAND, out, first)
     }
 
     pub fn not(&mut self, a: SignalId) -> GateDescriptor {
-        let out = self.add_signal(Some("OUT"));
+        let out = self.add_signal(None);
         let first = self.kinds.len();
         self.add_transistor(TransistorKind::PMOS, a, self.vdd(), out);
         self.add_transistor(TransistorKind::NMOS, a, self.gnd(), out);
-        let last = self.kinds.len();
-        GateDescriptor {
-            kind: GateKind::NOT,
-            inputs: vec![a],
-            output: out,
-            transistors: Some((first..last).collect()),
-            sub_gates: None,
-        }
+        self.stage(GateKind::NOT, out, first)
     }
 
     pub fn and(&mut self, a: SignalId, b: SignalId) -> GateDescriptor {
         let nand = self.nand(a, b);
         let not = self.not(nand.output);
-        GateDescriptor {
-            kind: GateKind::AND,
-            inputs: vec![a, b],
-            output: not.output,
-            transistors: None,
-            sub_gates: Some(vec![nand, not]),
-        }
+        GateDescriptor { kind: GateKind::AND,
+                         output: not.output,
+                         body: GateBody::Composite(vec![nand, not]) }
     }
 
     pub fn nor(&mut self, a: SignalId, b: SignalId) -> GateDescriptor {
-        let out = self.add_signal(Some("OUT"));
+        let out = self.add_signal(None);
         let mid = self.add_signal(None);
         let first = self.kinds.len();
         self.add_transistor(TransistorKind::PMOS, a, self.vdd(), mid);
         self.add_transistor(TransistorKind::PMOS, b, mid, out);
         self.add_transistor(TransistorKind::NMOS, a, self.gnd(), out);
         self.add_transistor(TransistorKind::NMOS, b, self.gnd(), out);
-        let last = self.kinds.len();
-        GateDescriptor {
-            kind: GateKind::NOR,
-            inputs: vec![a, b],
-            output: out,
-            transistors: Some((first..last).collect()),
-            sub_gates: None,
-        }
+        self.stage(GateKind::NOR, out, first)
     }
 
     pub fn or(&mut self, a: SignalId, b: SignalId, small: bool) -> GateDescriptor {
         if small {
             let nor = self.nor(a, b);
             let not = self.not(nor.output);
-            GateDescriptor {
-                kind: GateKind::OR,
-                inputs: vec![a, b],
-                output: not.output,
-                transistors: None,
-                sub_gates: Some(vec![nor, not]),
-            }
+            GateDescriptor { kind: GateKind::OR,
+                             output: not.output,
+                             body: GateBody::Composite(vec![nor, not]) }
         } else {
             let not_a = self.not(a);
             let not_b = self.not(b);
             let nand = self.nand(not_a.output, not_b.output);
-            GateDescriptor {
-                kind: GateKind::OR,
-                inputs: vec![a, b],
-                output: nand.output,
-                transistors: None,
-                sub_gates: Some(vec![not_a, not_b, nand]),
-            }
+            GateDescriptor { kind: GateKind::OR,
+                             output: nand.output,
+                             body: GateBody::Composite(vec![not_a, not_b, nand]) }
         }
     }
 
@@ -411,24 +324,16 @@ impl SignalGraph {
         let s2 = self.nand(a, s1.output);
         let s3 = self.nand(b, s1.output);
         let xor = self.nand(s2.output, s3.output);
-        GateDescriptor {
-            kind: GateKind::XOR,
-            inputs: vec![a, b],
-            output: xor.output,
-            transistors: None,
-            sub_gates: Some(vec![s1, s2, s3, xor]),
-        }
+        GateDescriptor { kind: GateKind::XOR,
+                         output: xor.output,
+                         body: GateBody::Composite(vec![s1, s2, s3, xor]) }
     }
 
     pub fn xnor(&mut self, a: SignalId, b: SignalId) -> GateDescriptor {
         let xor = self.xor(a, b);
         let xnor = self.not(xor.output);
-        GateDescriptor {
-            kind: GateKind::XNOR,
-            inputs: vec![a, b],
-            output: xnor.output,
-            transistors: None,
-            sub_gates: Some(vec![xor, xnor]),
-        }
+        GateDescriptor { kind: GateKind::XNOR,
+                         output: xnor.output,
+                         body: GateBody::Composite(vec![xor, xnor]) }
     }
 }

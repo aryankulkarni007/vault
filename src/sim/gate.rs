@@ -1,9 +1,7 @@
 #![allow(clippy::upper_case_acronyms)]
-use crate::sim::transistor::{GateDescriptor, SignalGraph, SignalId};
-use crate::sim::transistor::{SignalState, TransistorKind};
-use std::vec;
+use crate::sim::transistor::{GateBody, GateDescriptor, SignalGraph, SignalId};
 
-struct GateId(usize);
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum GateKind {
     NOT,
     NAND,
@@ -14,33 +12,52 @@ pub enum GateKind {
     XNOR,
 }
 
-pub enum UnitKind {
-    Primitive(GateKind),
-    Composite,
+impl GateKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            GateKind::NOT => "NOT",
+            GateKind::NAND => "NAND",
+            GateKind::AND => "AND",
+            GateKind::OR => "OR",
+            GateKind::NOR => "NOR",
+            GateKind::XOR => "XOR",
+            GateKind::XNOR => "XNOR",
+        }
+    }
 }
 
 pub struct UnitDescriptor {
     pub name: String,
-    pub kind: UnitKind,
-    pub inputs: Vec<SignalId>,
     pub outputs: Vec<SignalId>,
-    pub gates: Option<Vec<GateDescriptor>>, // for composites
-    pub children: Option<Vec<UnitDescriptor>>, // for nested units
+    pub gates: Vec<GateDescriptor>, // gates built directly by this unit
+    pub children: Vec<UnitDescriptor>, // nested units, built before `gates`
 }
 
-pub struct Schematic {
-    pub units: Vec<UnitDescriptor>,
+impl UnitDescriptor {
+    /// Every gate in construction order (children first, then own gates),
+    /// grouped by the element directly under this unit: one group per child
+    /// unit, one per own gate.
+    pub fn flatten(&self) -> Vec<(String, Vec<&GateDescriptor>)> {
+        let mut out = Vec::new();
+        for child in &self.children {
+            let gates = child.flatten().into_iter().flat_map(|(_, g)| g).collect();
+            out.push((child.name.clone(), gates));
+        }
+        out.extend(
+            self.gates
+                .iter()
+                .map(|g| (g.kind.name().to_string(), vec![g])),
+        );
+        out
+    }
 }
 
-pub struct UnitId(usize);
+/// Builders for multi-gate units. Stateless; it exists to group the builders.
+pub struct Schematic;
+
 impl Schematic {
     pub fn new() -> Self {
-        Schematic { units: Vec::new() }
-    }
-    pub fn add_unit(&mut self, unit: UnitDescriptor) -> UnitId {
-        let id = self.units.len();
-        self.units.push(unit);
-        UnitId(id)
+        Schematic
     }
 }
 
@@ -55,11 +72,9 @@ impl Schematic {
         let carry = graph.and(a, b);
         UnitDescriptor {
             name: "Half Adder".to_string(),
-            kind: UnitKind::Composite,
-            inputs: vec![a, b],
             outputs: vec![sum.output, carry.output],
-            gates: Some(vec![sum, carry]),
-            children: None,
+            gates: vec![sum, carry],
+            children: vec![],
         }
     }
     pub fn full_adder(
@@ -74,11 +89,9 @@ impl Schematic {
         let cout = graph.or(ha1.outputs[1], ha2.outputs[1], true);
         UnitDescriptor {
             name: "Full Adder".to_string(),
-            kind: UnitKind::Composite,
-            inputs: vec![a, b, cin],
             outputs: vec![ha2.outputs[0], cout.output],
-            gates: Some(vec![cout]),
-            children: Some(vec![ha1, ha2]),
+            gates: vec![cout],
+            children: vec![ha1, ha2],
         }
     }
 
@@ -96,8 +109,6 @@ impl Schematic {
         let ad4 = self.full_adder(graph, a[3], b[3], ad3.outputs[1]);
         UnitDescriptor {
             name: "4 bit Ripple Adder".to_string(),
-            kind: UnitKind::Composite,
-            inputs: a.iter().chain(b.iter()).copied().chain([cin]).collect(),
             outputs: vec![
                 ad1.outputs[0],
                 ad2.outputs[0],
@@ -105,8 +116,8 @@ impl Schematic {
                 ad4.outputs[0],
                 ad4.outputs[1],
             ],
-            gates: None,
-            children: Some(vec![ad1, ad2, ad3, ad4]),
+            gates: vec![],
+            children: vec![ad1, ad2, ad3, ad4],
         }
     }
 
@@ -123,11 +134,9 @@ impl Schematic {
         let out = graph.or(a_gate.output, b_gate.output, true);
         UnitDescriptor {
             name: "MUX 2:1".to_string(),
-            kind: UnitKind::Composite,
-            inputs: vec![a, b, sel],
             outputs: vec![out.output],
-            gates: Some(vec![not_sel, a_gate, b_gate, out]),
-            children: None,
+            gates: vec![not_sel, a_gate, b_gate, out],
+            children: vec![],
         }
     }
 
@@ -147,11 +156,9 @@ impl Schematic {
         let out = self.mux_2to1(graph, r1.outputs[0], r2.outputs[0], sel2);
         UnitDescriptor {
             name: "MUX 4:1".to_string(),
-            kind: UnitKind::Composite,
-            inputs: vec![a, b, c, d, sel1, sel2],
             outputs: vec![out.outputs[0]],
-            gates: None,
-            children: Some(vec![r1, r2, out]),
+            gates: vec![],
+            children: vec![r1, r2, out],
         }
     }
 
@@ -166,8 +173,8 @@ impl Schematic {
         reset: SignalId,
     ) -> UnitDescriptor {
         use crate::sim::transistor::TransistorKind::*;
-        let q = graph.add_sequential_signal(Some("Q"));
-        let not_q = graph.add_sequential_signal(Some("!Q"));
+        let q = graph.add_signal(Some("Q"));
+        let not_q = graph.add_signal(Some("!Q"));
         let mid_top = graph.add_signal(None);
         let mid_bot = graph.add_signal(None);
 
@@ -187,27 +194,21 @@ impl Schematic {
 
         let nand1 = GateDescriptor {
             kind: GateKind::NAND,
-            inputs: vec![set, not_q],
             output: q,
-            transistors: Some((first1..last1).collect()),
-            sub_gates: None,
+            body: GateBody::Stage((first1..last1).collect()),
         };
 
         let nand2 = GateDescriptor {
             kind: GateKind::NAND,
-            inputs: vec![reset, q],
             output: not_q,
-            transistors: Some((first2..last2).collect()),
-            sub_gates: None,
+            body: GateBody::Stage((first2..last2).collect()),
         };
 
         UnitDescriptor {
             name: "SR Latch".to_string(),
-            kind: UnitKind::Composite,
-            inputs: vec![set, reset],
             outputs: vec![q, not_q],
-            gates: Some(vec![nand1, nand2]),
-            children: None,
+            gates: vec![nand1, nand2],
+            children: vec![],
         }
     }
 }
